@@ -46,8 +46,8 @@ run('git', 'apply', ROOT / 'voicestudio/source.patch', cwd=SOURCE)
 run(TOOLS / 'node_modules/bun/bin/bun.exe', 'install', '--frozen-lockfile', cwd=SOURCE)
 run(TOOLS / 'node_modules/bun/bin/bun.exe', 'run', '--cwd', 'electron', 'typecheck', cwd=SOURCE)
 run(TOOLS / 'node_modules/bun/bin/bun.exe', 'run', '--cwd', 'electron', 'build', cwd=SOURCE)
-run(sys.executable, '-m', 'unittest', 'discover', '-s', 'tests', '-p', 'test_line_subtitle*.py', '-v', cwd=SOURCE)
-run(sys.executable, '-m', 'unittest', 'discover', '-s', 'tests', '-p', 'test_txt_srt_updater.py', '-v', cwd=SOURCE)
+for test in ['test_line_subtitles.py', 'test_line_subtitle_finalize.py', 'test_txt_srt_updater.py']:
+    run(sys.executable, SOURCE / 'tests' / test, '-v', cwd=SOURCE)
 
 installer = WORK / 'VoiceStudio-0.5.8-win-x64.exe'
 urllib.request.urlretrieve('https://github.com/debpalash/VoiceStudio/releases/download/v0.5.8/VoiceStudio-0.5.8-win-x64.exe', installer)
