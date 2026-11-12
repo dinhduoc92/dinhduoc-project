@@ -32,13 +32,15 @@ function Get-DDVSOwnerKey([string]$Path) {
     if (Test-Path -LiteralPath $Path) {
         $private = [Security.Cryptography.ProtectedData]::Unprotect([IO.File]::ReadAllBytes($Path), $script:DDVSEntropy, [Security.Cryptography.DataProtectionScope]::CurrentUser)
         $rsa = [Security.Cryptography.RSA]::Create()
+        if ($rsa -is [Security.Cryptography.RSACryptoServiceProvider]) { $rsa.PersistKeyInCsp = $false }
         try { $rsa.FromXmlString([Text.Encoding]::UTF8.GetString($private)) }
         catch { $rsa.Dispose(); throw }
         finally { [Array]::Clear($private,0,$private.Length) }
         return $rsa
     }
-    $rsa = [Security.Cryptography.RSA]::Create()
-    $rsa.KeySize = 3072
+    $provider = New-Object Security.Cryptography.CspParameters -ArgumentList 24
+    $rsa = New-Object Security.Cryptography.RSACryptoServiceProvider -ArgumentList 3072,$provider
+    $rsa.PersistKeyInCsp = $false
     try { Save-DDVSPrivateKey $rsa $Path } catch { $rsa.Dispose(); throw }
     return $rsa
 }
