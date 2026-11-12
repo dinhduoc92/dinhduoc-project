@@ -1,0 +1,72 @@
+VOICE STUDIO - TAO GIONG TU TXT VA LUU AUDIO + SRT
+
+Gói cập nhật tùy chỉnh cho bản chính thức VoiceStudio 0.5.8 Windows x64.
+Đây không phải bản phát hành chính thức của tác giả VoiceStudio.
+
+CÀI BẢN TÍCH HỢP
+1. Giải nén toàn bộ ZIP vào một thư mục. Không chạy trực tiếp trong ZIP.
+2. Thoát VoiceStudio hoàn toàn, kể cả biểu tượng ở khay hệ thống.
+3. Nhấp đúp UPDATE.cmd.
+4. Nếu được hỏi, chọn thư mục chứa VoiceStudio.exe, KHÔNG chọn thư mục mô hình.
+5. Đợi dòng “Updated”, rồi mở lại VoiceStudio.
+
+Bộ cập nhật kiểm tra checksum của bản 0.5.8 gốc và toàn bộ payload trước khi sửa.
+Nó sao lưu các file ứng dụng được thay thế và không thay đổi thư mục dữ liệu,
+giọng clone, mô hình, dự án, cài đặt hoặc chấp nhận giấy phép của bạn.
+Nếu ứng dụng được cài cho mọi người trong Program Files, việc cập nhật có thể
+cần quyền quản trị. Không tiếp tục nếu thông báo cho biết khác phiên bản.
+
+MỘT TXT
+- Vào Nhân bản giọng nói, chọn giọng đã lưu và ngôn ngữ cần đọc.
+- Bấm Nhập kịch bản và chọn Bai_01.txt. Văn bản cũ được thay bằng TXT này.
+- Mục “Lưu âm thanh + SRT (mỗi dòng văn bản là một mục phụ đề)” tự bật.
+- Bấm Tổng hợp âm thanh.
+- Ở bản thu mới nhất, bấm Lưu âm thanh + SRT để chọn nơi lưu một lần.
+- Kết quả: Bai_01.wav và Bai_01.srt. Chọn MP3 ở menu cạnh nút lưu để được
+  Bai_01.mp3 và Bai_01.srt.
+
+NHIỀU TXT
+- Trong Nhập kịch bản, chọn nhiều TXT cùng lúc (Ctrl hoặc Shift).
+- Danh sách được xếp theo tên tự nhiên: Bai_01, Bai_02, Bai_03, ...
+- Ô văn bản hiển thị file đầu tiên; chỉnh sửa ở đó áp dụng cho file đầu tiên.
+- Chọn WAV + SRT hoặc MP3 + SRT.
+- Bấm Tổng hợp âm thanh, chọn thư mục đầu ra MỘT LẦN.
+- App tạo từng file rồi tự lưu từng cặp theo đúng tên TXT trước khi sang file sau.
+- Mỗi lần chạy dùng chung giọng, ngôn ngữ và thông số đã chọn lúc bắt đầu.
+  Hãy chạy các nhóm khác nhau nếu cần giọng hoặc ngôn ngữ khác nhau.
+- Bấm nút hủy để dừng hàng đợi. Các cặp đã lưu xong vẫn được giữ.
+- Nếu tên đầu ra đã có sẵn hoặc gặp lỗi ghi, app dừng; không ghi đè file cũ.
+
+SRT VÀ ÂM THANH
+Mỗi dòng thực tế không trống trong TXT là một mục SRT. Xuống dòng do ô nhập tự
+ngắt hiển thị không được tính là dòng mới. Dòng trống được bỏ qua.
+App tổng hợp riêng từng dòng, ghép theo thứ tự và lấy số mẫu âm thanh thực tế để
+cộng dồn thời gian. Không cần chuyển sang Transcriptions hoặc tải mô hình ASR.
+Phụ đề giữ nguyên chữ gốc; phát âm và chuẩn hóa số chỉ tác động phần giọng đọc.
+Mốc phụ đề bao phủ cả đoạn âm thanh của dòng, kể cả khoảng lặng do mô hình tạo;
+đây không phải căn từng từ bằng nhận dạng giọng nói.
+
+Audio đã tạo từ trước khi bật chế độ này cần được tổng hợp lại từ TXT để có
+mốc theo dòng. Tạo riêng từng câu có thể làm nhịp đọc khác so với tạo cả đoạn.
+Hãy nghe kiểm tra phát âm, lặp từ hoặc bỏ sót trước khi sử dụng. Giấy phép của
+mô hình và quyền sử dụng giọng mẫu vẫn áp dụng như trước.
+
+KHÔI PHỤC
+Thoát VoiceStudio rồi nhấp RESTORE.cmd trong thư mục gói cập nhật.
+Bản sao lưu nằm trong resources\txt-srt-backup-... của ứng dụng.
+Giữ nguyên thư mục gói cập nhật nếu muốn dùng RESTORE.cmd về sau.
+Một bản cập nhật chính thức sau này có thể thay thế tính năng tùy chỉnh này.
+
+PHẠM VI KIỂM THỬ
+- TypeScript, build ứng dụng, kiểm tra bản dịch 22 ngôn ngữ.
+- Kiểm tra lưu cặp file, hàng đợi, lỗi lưu, hủy chọn thư mục và tên file.
+- Kiểm tra thời gian SRT theo số mẫu và không công bố bản thu khi lưu SRT lỗi.
+- Kiểm tra Chromium với giao diện tiếng Việt và backend/bridge giả lập.
+- Kiểm tra cú pháp PowerShell và logic cập nhật/khôi phục với file giả lập.
+Chưa chạy ứng dụng đã cập nhật trên Windows thật và chưa kiểm tra suy luận GPU
+RTX 5060 hoặc chất lượng giọng thực tế. Gói này không chứa mô hình AI mới.
+
+MÃ NGUỒN VÀ GIẤY PHÉP
+SOURCE.zip (tải riêng ở cùng trang phát hành) chứa mã nguồn tương ứng với bản tùy chỉnh và các kiểm tra.
+Nền: https://github.com/debpalash/VoiceStudio/tree/v0.5.8
+LICENSE và LICENSE-NOTICE.md đi kèm. Ứng dụng theo AGPL-3.0; mô hình có giấy phép riêng.

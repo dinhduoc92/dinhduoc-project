@@ -1,0 +1,39 @@
+name: Build VoiceStudio TXT Audio SRT update
+on:
+  push:
+    branches: [voicestudio-txt-srt-0.5.8]
+    paths: ['voicestudio/**', '.github/workflows/voicestudio-txt-srt.yml']
+  workflow_dispatch:
+permissions:
+  contents: write
+jobs:
+  windows-update:
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - name: Install build tools
+        shell: pwsh
+        run: |
+          npm install --prefix tooling bun@1.4.2 @electron/asar@4.3.1 7zip-bin@5.2.0 --no-audit --no-fund
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          (Resolve-Path tooling/node_modules/bun/bin).Path | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+          (Resolve-Path tooling/node_modules/.bin).Path | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+      - name: Build and verify the update on Windows
+        shell: pwsh
+        run: python voicestudio/build_update.py
+      - name: Attach files to the owner's draft release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $files = Get-ChildItem -File dist | ForEach-Object FullName
+          gh release upload voicestudio-txt-srt-0.5.8-20261112 @files --repo $env:GITHUB_REPOSITORY --clobber
+      - name: Keep a downloadable build artifact
+        if: success() || failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: VoiceStudio-TXT-SRT-Windows-update
+          path: dist/*
+          if-no-files-found: warn
+          retention-days: 14

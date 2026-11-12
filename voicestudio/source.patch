@@ -1,0 +1,3101 @@
+diff --git a/backend/api/routers/generation.py b/backend/api/routers/generation.py
+index 0fd22e7..4d87066 100644
+--- a/backend/api/routers/generation.py
++++ b/backend/api/routers/generation.py
+@@ -1661,7 +1661,7 @@ async def _finalize_generation(
+     audio_tensor, sample_rate, *, text, history_mode, ref_audio_path,
+     language, instruct, resolved_profile_id, used_seed, start_time,
+     already_marked=False, design_recipe=None, wav_bits=16, include_wav_bytes=False,
+-    engine_id=None,
++    engine_id=None, subtitle_srt=None, subtitle_frames=None,
+ ):
+     """Shared tail of a successful generation: watermark → save WAV →
+     history row (self-healing) → retention prune → event emit.
+@@ -1695,6 +1695,8 @@ async def _finalize_generation(
+         audio_tensor = await mark_synthetic_async(
+             audio_tensor, sample_rate, context="generate.finalize",
+         )
++    if subtitle_frames is not None and audio_tensor.shape[-1] != subtitle_frames:
++        raise ValueError("Final audio length changed; subtitle timing is unavailable")
+     gen_time = round(time.time() - start_time, 2)
+ 
+     for _ in range(16):
+@@ -1709,14 +1711,24 @@ async def _finalize_generation(
+         break
+     else:
+         raise OSError("Could not reserve a unique recording filename")
++    subtitle_path = Path(audio_path).with_suffix(".srt")
++    subtitle_created = False
++
+     def _save_take():
++        nonlocal subtitle_created
+         try:
+             save_generation_wav(audio_path, audio_tensor, sample_rate, bits=wav_bits)
++            if subtitle_srt is not None:
++                with subtitle_path.open("x", encoding="utf-8-sig") as subtitle:
++                    subtitle_created = True
++                    subtitle.write(subtitle_srt)
+             # Capture before creating the history row: concurrent retention cannot
+             # see or remove this take yet. Encoding and disk I/O stay off the loop.
+             return Path(audio_path).read_bytes() if include_wav_bytes else None
+         except Exception:
+             Path(audio_path).unlink(missing_ok=True)
++            if subtitle_created:
++                subtitle_path.unlink(missing_ok=True)
+             raise
+ 
+     saving = asyncio.create_task(asyncio.to_thread(_save_take))
+@@ -1738,6 +1750,8 @@ async def _finalize_generation(
+         except Exception:
+             pass  # Preserve cancellation if the interrupted write also failed.
+         Path(audio_path).unlink(missing_ok=True)
++        if subtitle_created:
++            subtitle_path.unlink(missing_ok=True)
+         raise
+ 
+     audio_dur = round(audio_tensor.shape[-1] / sample_rate, 2)
+@@ -1936,6 +1950,7 @@ async def generate_speech(
+     # classic flow, so streaming is purely a delivery channel — engine-agnostic
+     # (text-level chunking, no per-engine token streaming).
+     stream: bool = Form(False),
++    subtitle_lines: bool = Form(False),
+ ):
+     """Generate a voice take through the selected TTS engine.
+ 
+@@ -1951,6 +1966,13 @@ async def generate_speech(
+     # (utils/duration.py) so the estimate and the synthesis see the same text.
+     import unicodedata
+     text = unicodedata.normalize("NFC", text)
++    from services.line_subtitles import LineClock, script_lines
++    caption_lines = script_lines(text) if subtitle_lines else []
++    if subtitle_lines and (not caption_lines or duration is not None):
++        raise HTTPException(status_code=422, detail="Line subtitles need non-empty text and automatic duration.")
++    # Line mode returns a canonical WAV plus its sidecar, never an NDJSON preview.
++    if subtitle_lines:
++        stream = False
+ 
+     # ── Engine resolution (issue #312) ──────────────────────────────────────
+     # The request runs on the engine selected in Settings (POST /engines/select,
+@@ -2346,7 +2368,8 @@ async def generate_speech(
+     # in services/text_normalization.py). Pref-gated (default ON), idempotent,
+     # never raises; applied exactly once per request, at this choke point.
+     from services.text_normalization import normalize_for_tts
+-    text = normalize_for_tts(text, language)
++    text = ("\n".join(normalize_for_tts(line, language) for line in caption_lines)
++            if subtitle_lines else normalize_for_tts(text, language))
+ 
+     # Expressive-TTS Spec 01: apply the user pronunciation dictionary + inline
+     # [[…]] one-off overrides to the text, here — AFTER `language` is fully
+@@ -2363,15 +2386,18 @@ async def generate_speech(
+             _pron_rows = load_entries_from_db()
+         except Exception:  # noqa: BLE001 — table missing / DB locked → no-op
+             _pron_rows = []
+-        text = apply_pronunciation(
+-            text, _pron_rows, language, profile_id=resolved_profile_id,
++        transform = lambda value: apply_pronunciation(
++            value, _pron_rows, language, profile_id=resolved_profile_id,
+         )
++        render_lines = [transform(normalize_for_tts(line, language)) for line in caption_lines]
++        text = "\n".join(render_lines) if subtitle_lines else transform(text)
+     else:
+         # Even with the dictionary off, inline [[…]] overrides are an explicit,
+         # in-text authoring choice → always honored (and never left as literal
+         # double-bracket text the model would mispronounce).
+         from services.pronunciation import apply_inline_overrides
+-        text = apply_inline_overrides(text)
++        render_lines = [apply_inline_overrides(normalize_for_tts(line, language)) for line in caption_lines]
++        text = "\n".join(render_lines) if subtitle_lines else apply_inline_overrides(text)
+ 
+     start_time = time.time()
+ 
+@@ -2765,24 +2791,45 @@ async def generate_speech(
+                 class_temperature, used_seed, effect_preset,
+                 max_chunk_chars, crossfade_ms, dropped_sink=_dropped_text,
+             )
+-        audio_tensor = await _run_with_reference_lease(
+-            ref_lease,
++        async def render_one(render):
++            return await _run_with_reference_lease(
++                ref_lease,
+                 lambda release: gpu_gateway.run(
+-                local=gpu_gateway.LocalCall(
+-                    _local_render, what="TTS generate",
+-                    timeout=_generate_timeout_s(
+-                        text,
+-                        engine=_backend,
+-                        execution_device=_routing["effective_device"],
++                    local=gpu_gateway.LocalCall(
++                        render, what="TTS generate",
++                        timeout=_generate_timeout_s(
++                            render.args[1],
++                            engine=_backend,
++                            execution_device=_routing["effective_device"],
++                            min_vram_gb=_engine_min_vram_gb,
++                            hardware_family=_routing_hardware_family,
++                            vram_gb=_routing_vram_gb,
++                        ),
+                         min_vram_gb=_engine_min_vram_gb,
+-                        hardware_family=_routing_hardware_family,
+-                        vram_gb=_routing_vram_gb,
+-                    ),
+-                    min_vram_gb=_engine_min_vram_gb,
+-                    on_abandon=release,
++                        on_abandon=release,
+                     ),
++                ),
+             )
+-        )
++        line_clock = LineClock(caption_lines) if subtitle_lines else None
++        if line_clock is not None:
++            import torch
++            parts = []
++            for line in render_lines:
++                if not line.strip():
++                    raise HTTPException(status_code=422, detail="A script line has no spoken text.")
++                args = list(_local_render.args)
++                args[1] = line
++                render = functools.partial(_local_render.func, *args, **_local_render.keywords)
++                before_dropped = len(_dropped_text)
++                part = await render_one(render)
++                if len(_dropped_text) != before_dropped:
++                    raise HTTPException(status_code=422, detail="A line contains missing speech; subtitles were not published.")
++                rate = _backend.sample_rate if _backend is not None else _model.sampling_rate
++                line_clock.append(part.shape[-1], rate)
++                parts.append(part.detach().cpu())
++            audio_tensor = torch.cat(parts, dim=-1)
++        else:
++            audio_tensor = await render_one(_local_render)
+         # Read after generation: engines with lazy model loading report
+         # their real rate only once weights are up.
+         sample_rate = (_backend.sample_rate if _backend is not None
+@@ -2795,6 +2842,8 @@ async def generate_speech(
+             resolved_profile_id=resolved_profile_id, used_seed=used_seed,
+             start_time=start_time, already_marked=False, wav_bits=int(wav_bits), include_wav_bytes=True,
+             design_recipe=stored_design_recipe, engine_id=engine_id,
++            subtitle_srt=line_clock.srt() if line_clock is not None else None,
++            subtitle_frames=line_clock.frames if line_clock is not None else None,
+         )
+         audio_id = _meta["id"]
+         audio_filename = _meta["filename"]
+@@ -2817,6 +2866,8 @@ async def generate_speech(
+             "X-Audio-Duration": str(audio_dur),
+             "Content-Length": str(len(wav_bytes)),
+         }
++        if line_clock is not None:
++            _resp_headers["X-Subtitle-Path"] = f"{audio_id}.srt"
+         # #1330: the body is a WAV, so the header channel carries the notice
+         # that some of the text produced no audio. Count first (always exact),
+         # then as much of the lost text as a header can safely hold.
+@@ -2914,6 +2965,8 @@ def _remove_deferred_wavs(paths) -> None:
+     for p in paths:
+         with contextlib.suppress(OSError):
+             os.remove(p)
++        with contextlib.suppress(OSError):
++            Path(p).with_suffix(".srt").unlink(missing_ok=True)
+ 
+ 
+ def _remove_wav_if_unreferenced(conn, audio_path, exclude_ids=(), defer=None):
+@@ -2945,6 +2998,8 @@ def _remove_wav_if_unreferenced(conn, audio_path, exclude_ids=(), defer=None):
+         return
+     with contextlib.suppress(OSError):
+         os.remove(p)
++    with contextlib.suppress(OSError):
++        Path(p).with_suffix(".srt").unlink(missing_ok=True)
+ 
+ 
+ # How many takes to keep before pruning the oldest UNstarred ones (rows + their
+@@ -3042,6 +3097,8 @@ def list_history():
+                 # What "save as voice" may use as the take's transcript; ""
+                 # asks for the take's audio to be transcribed (#3062).
+                 item["transcript"] = take_reference_transcript(item.get("text"))
++                if p and Path(p).with_suffix(".srt").is_file():
++                    item["subtitle_path"] = Path(p).with_suffix(".srt").name
+                 alive.append(item)
+         if stale_ids:
+             conn.executemany(
+diff --git a/backend/core/csrf.py b/backend/core/csrf.py
+index 6141de4..50cff4c 100644
+--- a/backend/core/csrf.py
++++ b/backend/core/csrf.py
+@@ -148,6 +148,7 @@ CORS_EXPOSED_HEADERS = (
+     "Content-Disposition",
+     "X-Audio-Id",
+     "X-Audio-Path",
++    "X-Subtitle-Path",
+     "X-Audio-Duration",
+     "X-Gen-Time",
+     "X-Seed",
+diff --git a/backend/services/line_subtitles.py b/backend/services/line_subtitles.py
+new file mode 100644
+index 0000000..86d87a3
+--- /dev/null
++++ b/backend/services/line_subtitles.py
+@@ -0,0 +1,45 @@
++"""Line-preserving subtitle timing, measured in generated audio samples."""
++from dataclasses import dataclass
++
++
++def script_lines(text: str) -> list[str]:
++    return [line.strip() for line in text.splitlines() if line.strip()]
++
++
++def timestamp(frames: int, sample_rate: int) -> str:
++    if frames < 0 or sample_rate <= 0:
++        raise ValueError("Invalid subtitle sample clock")
++    milliseconds = (frames * 1000 + sample_rate // 2) // sample_rate
++    seconds, milliseconds = divmod(milliseconds, 1000)
++    minutes, seconds = divmod(seconds, 60)
++    hours, minutes = divmod(minutes, 60)
++    return f"{hours:02}:{minutes:02}:{seconds:02},{milliseconds:03}"
++
++
++@dataclass
++class LineClock:
++    lines: list[str]
++    frames: int = 0
++    sample_rate: int | None = None
++
++    def __post_init__(self) -> None:
++        self.cues: list[str] = []
++
++    def append(self, frame_count: int, sample_rate: int) -> None:
++        if len(self.cues) >= len(self.lines) or frame_count <= 0 or sample_rate <= 0:
++            raise ValueError("Missing or unexpected line audio")
++        if self.sample_rate is not None and self.sample_rate != sample_rate:
++            raise ValueError("Audio sample rate changed between lines")
++        self.sample_rate = sample_rate
++        start = timestamp(self.frames, sample_rate)
++        end = timestamp(self.frames + frame_count, sample_rate)
++        if start == end:
++            raise ValueError("Line audio is too short for SRT")
++        index = len(self.cues)
++        self.cues.append(f"{index + 1}\n{start} --> {end}\n{self.lines[index]}\n")
++        self.frames += frame_count
++
++    def srt(self) -> str:
++        if not self.lines or len(self.cues) != len(self.lines):
++            raise ValueError("Not all script lines have audio")
++        return "\n".join(self.cues)
+diff --git a/docs/electron-longform.md b/docs/electron-longform.md
+index c4cfbff..d618fbb 100644
+--- a/docs/electron-longform.md
++++ b/docs/electron-longform.md
+@@ -75,3 +75,8 @@ The finished-render library filters for Stories and Audiobooks before applying i
+ Resuming starts a fresh job while preserving the original checkpoint until all chapters render successfully. Checkpoint writes and syncs are best effort, so an interrupted resumed job can leave both the original and new checkpoints available; either can reuse the shared chapter cache. Closing an unstarted response or interrupting the render leaves the original plan available, including when a replacement checkpoint could not be saved. A render with no failed chapters retires the original even if the replacement checkpoint could not be saved. A partial output keeps the original plan available to retry its failed chapters.
+ 
+ Cache pruning runs when a render exits, including after Stop, and evicts unused chapter and segment audio oldest first. Each render reserves existing inputs before reporting progress or loading its engine, then keeps the whole plan's chapter and segment inputs protected until it exits. This includes later chapters and reusable segments that a resumed book has not reached yet, plus temporary WAVs being published. Unrelated audio becomes evictable once the plan's inputs are identified. Protected files and JSON bookkeeping needed to locate older entries after moving the data directory count toward the cache size, so the budget may be exceeded until a later render can evict them. An unsuccessful or cancelled FFmpeg assembly removes its incomplete output and retains the recovery checkpoint.
++
++## TXT narration with paired subtitles
++
++For one SRT cue per source line and sequential multi-TXT exports directly in Voice
++cloning, see [TXT audio and SRT export](txt-srt-export.md).
+diff --git a/docs/txt-srt-export.md b/docs/txt-srt-export.md
+new file mode 100644
+index 0000000..d628243
+--- /dev/null
++++ b/docs/txt-srt-export.md
+@@ -0,0 +1,66 @@
++# TXT narration with audio and SRT together
++
++In **Voice cloning**, import a TXT file using **Import script**. This replaces
++rather than appends to the current script, remembers the TXT basename, and enables
++**Save audio + SRT (one subtitle per script line)**. A manually entered script
++can also enable the checkbox; without an imported filename it uses the usual take
++name.
++
++Each non-empty physical line is rendered independently, using the selected voice,
++language, quality and delivery settings. Soft wrapping in the editor does not
++create subtitle lines. SRT keeps the original text, including Japanese and Korean;
++normalization and pronunciation substitutions affect the spoken version only.
++Blank lines are ignored. Automatic duration is required in this mode.
++
++The final WAV is assembled in order without crossfading across TXT lines. Every
++cue covers the corresponding generated segment, measured in audio samples, so no
++transcription pass or ASR model is needed. Cues include any silence the speech
++model produces within that segment; they are segment boundaries, not word-level
++forced alignment. Generating separate sentences may change rhythm compared with
++rendering a whole paragraph. Generated speech should still be listened to for
++omissions, repetitions or pronunciation mistakes.
++
++After synthesis, the existing output **Save audio + SRT** button opens one native
++save dialog. Choosing `Bai_01.wav` writes both `Bai_01.wav` and `Bai_01.srt` in that
++directory. The adjacent format menu also offers MP3 with the same SRT. UTF-8 with
++a BOM preserves multilingual subtitle text in Windows editors. MP3 is encoded
++from the same WAV timeline; encoder padding may be handled differently by older
++players. Neither file is overwritten; choose another name or directory if either
++already exists. A failed write rolls back new files, and a failed subtitle
++download never writes the audio half.
++
++## Multiple TXT files
++
++Select several TXT files in **Import script**. Only TXT is accepted for a
++multi-file import. The queue lists them in natural filename order (`Bai_2` before
++`Bai_10`). The editor shows the first file; edits there affect that first file.
++Choose **WAV + SRT** or **MP3 + SRT**, then use the usual **Synthesize audio** action.
++Choose the destination directory once. Each file is synthesized and its pair is
++saved before the next starts, using that TXT's basename. The composer reports the
++current filename and file index. The voice, language and generation settings are
++snapshotted for the entire queue. Use separate batches for different languages or
++voices.
++
++Cancel stops the remaining queue. Complete pairs already saved remain; a pair
++being written finishes its save, and disk/backend errors stop subsequent files.
++The batch folder authorization is revoked at completion, failure or cancellation.
++**Keep only the first file** returns to single-file operation. The queue is kept
++only for the current app session.
++
++## Existing recordings and models
++
++Recordings made before line timing was enabled do not gain an SRT automatically.
++Re-render their source TXT with the checkbox enabled, or transcribe the existing
++recording. The custom feature does not change any model's license or voice consent
++requirements. Existing downloaded engines, profiles and projects remain in their
++usual storage locations.
++
++## Validation
++
++Focused renderer/main tests cover request flags, source filenames, ordered batch
++render/save, a single directory selection, MP3 routes, failed saves, duplicate
++outputs and capability revocation. Model-free backend tests cover sample-based
++cue timing, Unicode, rate changes, final audio length, and publication/rollback of
++the WAV/SRT pair. `electron/tests/txt-srt-smoke.mjs` exercises the Vietnamese clone
++UI in Chromium with a mocked backend and native save bridge. These checks do not
++certify speech quality or GPU inference on a Windows device.
+diff --git a/electron/src/main/ipc-save.test.ts b/electron/src/main/ipc-save.test.ts
+index a63d2b7..eb7e0c5 100644
+--- a/electron/src/main/ipc-save.test.ts
++++ b/electron/src/main/ipc-save.test.ts
+@@ -9,6 +9,7 @@ const native = vi.hoisted(() => ({
+   handlers: new Map<string, (event: unknown, raw: unknown) => Promise<unknown>>(),
+   savePath: '',
+   failWrites: false,
++  exportDirectory: '',
+   setupLog: vi.fn(async () => 'sanitized setup log'),
+   setupCheck: vi.fn(async () => ({ status: 'unavailable' })),
+ }));
+@@ -51,6 +52,7 @@ vi.mock('electron', () => ({
+   BrowserWindow: { fromWebContents: () => owner, getAllWindows: () => [] },
+   dialog: {
+     showSaveDialog: vi.fn(async () => ({ canceled: false, filePath: native.savePath })),
++    showOpenDialog: vi.fn(async () => ({ canceled: false, filePaths: [native.exportDirectory] })),
+   },
+   ipcMain: {
+     handle: (channel: string, handler: (event: unknown, raw: unknown) => Promise<unknown>) =>
+@@ -73,6 +75,7 @@ const event = { sender: owner.webContents, senderFrame: owner.webContents.mainFr
+ beforeEach(async () => {
+   directory = await mkdtemp(join(tmpdir(), 'voicestudio-save-'));
+   native.savePath = join(directory, 'take.wav');
++  native.exportDirectory = directory;
+   native.failWrites = false;
+   native.handlers.clear();
+   registerIpc(
+@@ -108,7 +111,9 @@ it.each(saves)(
+   async (_, channel, request) => {
+     await writeFile(native.savePath, 'complete previous export');
+     native.failWrites = true;
+-    await expect(native.handlers.get(channel)!(event, request())).rejects.toThrow('no space');
++    await expect(native.handlers.get(channel)!(event, request())).rejects.toMatchObject({
++      message: expect.stringContaining('no space'),
++    });
+     expect(await readFile(native.savePath, 'utf8')).toBe('complete previous export');
+     expect(await readdir(directory)).toEqual(['take.wav']);
+   },
+@@ -166,3 +171,75 @@ it.each([CHANNELS.backendSetupDiagnostics, CHANNELS.backendCheckSetupConnection]
+     );
+   },
+ );
++
++it('saves audio and SRT with one dialog and the chosen basename', async () => {
++  const { dialog, net } = await import('electron');
++  vi.mocked(dialog.showSaveDialog).mockClear();
++  vi.mocked(net.fetch)
++    .mockResolvedValueOnce(new Response('audio'))
++    .mockResolvedValueOnce(new Response('captions'));
++  await native.handlers.get(CHANNELS.filesSaveAudio)!(event, {
++    url: '/api/audio/12345678.wav',
++    subtitleUrl: '/api/audio/12345678.srt',
++    suggestedName: 'Bai_01.wav',
++  });
++  expect(dialog.showSaveDialog).toHaveBeenCalledTimes(1);
++  expect(await readFile(join(directory, 'take.wav'), 'utf8')).toBe('audio');
++  expect(await readFile(join(directory, 'take.srt'), 'utf8')).toBe('captions');
++});
++it('does not write audio when the subtitle download fails', async () => {
++  const { net } = await import('electron');
++  vi.mocked(net.fetch)
++    .mockResolvedValueOnce(new Response('audio'))
++    .mockResolvedValueOnce(new Response('missing', { status: 404 }));
++  await expect(
++    native.handlers.get(CHANNELS.filesSaveAudio)!(event, {
++      url: '/api/audio/12345678.wav',
++      subtitleUrl: '/api/audio/12345678.srt',
++      suggestedName: 'Bai_01.wav',
++    }),
++  ).rejects.toThrow();
++  expect(await readdir(directory)).toEqual([]);
++});
++it('rejects external subtitle URLs before sending backend credentials', async () => {
++  const { net } = await import('electron');
++  vi.mocked(net.fetch).mockClear();
++  await expect(
++    native.handlers.get(CHANNELS.filesSaveAudio)!(event, {
++      url: '/api/audio/12345678.wav',
++      subtitleUrl: 'https://example.com/steal',
++      suggestedName: 'Bai_01.wav',
++    }),
++  ).rejects.toMatchObject({ message: expect.stringContaining('active VoiceStudio backend') });
++  expect(net.fetch).not.toHaveBeenCalled();
++});
++it('saves a batch in one authorized directory without per-file dialogs, then revokes it', async () => {
++  const { dialog } = await import('electron');
++  vi.mocked(dialog.showSaveDialog).mockClear();
++  const token = await native.handlers.get('files:beginBatchExport')!(event, undefined);
++  expect(token).toEqual(expect.any(String));
++  const request = {
++    url: '/api/audio/12345678.wav',
++    subtitleUrl: '/api/audio/12345678.srt',
++    suggestedName: 'Bai_01.wav',
++    batchToken: token,
++  };
++  await native.handlers.get(CHANNELS.filesSaveAudio)!(event, request);
++  expect(dialog.showSaveDialog).not.toHaveBeenCalled();
++  expect((await readdir(directory)).sort()).toEqual(['Bai_01.srt', 'Bai_01.wav']);
++  await native.handlers.get('files:endBatchExport')!(event, token);
++  await expect(native.handlers.get(CHANNELS.filesSaveAudio)!(event, request)).rejects.toMatchObject(
++    { message: expect.stringContaining('expired') },
++  );
++});
++it('rolls back the audio and SRT pair when the disk fills', async () => {
++  native.failWrites = true;
++  await expect(
++    native.handlers.get(CHANNELS.filesSaveAudio)!(event, {
++      url: '/api/audio/12345678.wav',
++      subtitleUrl: '/api/audio/12345678.srt',
++      suggestedName: 'Bai_01.wav',
++    }),
++  ).rejects.toThrow();
++  expect(await readdir(directory)).toEqual([]);
++});
+diff --git a/electron/src/main/ipc.ts b/electron/src/main/ipc.ts
+index 8ce2fbf..86a5a97 100644
+--- a/electron/src/main/ipc.ts
++++ b/electron/src/main/ipc.ts
+@@ -10,6 +10,7 @@ import {
+ } from './media-authorization';
+ import { isTrustedRenderer } from './trusted-renderer';
+ import { replaceFile } from './replace-file';
++import { saveAudioSubtitlePair } from './save-audio-subtitle-pair';
+ import { encodeDownloadFailure, MAX_FAILURE_BODY_CHARS } from '../shared/download-failure';
+ import { homedir, tmpdir } from 'node:os';
+ import { dirname, isAbsolute, join, resolve } from 'node:path';
+@@ -69,7 +70,9 @@ const PYTHON_REPAIR_DIALOG_FALLBACK = {
+ } as const;
+ 
+ /** Translated native-dialog labels from the renderer, English when absent or malformed. */
+-export function pythonRepairDialogLabels(raw: unknown): Record<keyof typeof PYTHON_REPAIR_DIALOG_FALLBACK, string> {
++export function pythonRepairDialogLabels(
++  raw: unknown,
++): Record<keyof typeof PYTHON_REPAIR_DIALOG_FALLBACK, string> {
+   const input = raw && typeof raw === 'object' ? (raw as Record<string, unknown>) : {};
+   const pick = (key: keyof typeof PYTHON_REPAIR_DIALOG_FALLBACK) => {
+     const value = input[key];
+@@ -77,7 +80,12 @@ export function pythonRepairDialogLabels(raw: unknown): Record<keyof typeof PYTH
+       ? value
+       : PYTHON_REPAIR_DIALOG_FALLBACK[key];
+   };
+-  return { title: pick('title'), message: pick('message'), install: pick('install'), cancel: pick('cancel') };
++  return {
++    title: pick('title'),
++    message: pick('message'),
++    install: pick('install'),
++    cancel: pick('cancel'),
++  };
+ }
+ 
+ export const CHANNELS = {
+@@ -201,6 +209,10 @@ function assertSaveAudioRequest(value: unknown): SaveAudioRequest {
+     url: assertString(req.url, 'audio url'),
+     suggestedName: portableFilename(assertString(req.suggestedName, 'file name')),
+     method: req.method,
++    subtitleUrl:
++      req.subtitleUrl === undefined ? undefined : assertString(req.subtitleUrl, 'subtitle url'),
++    batchToken:
++      req.batchToken === undefined ? undefined : assertString(req.batchToken, 'batch token'),
+   };
+ }
+ 
+@@ -388,19 +400,35 @@ export function registerIpc(
+   let discoveryInFlight: Promise<PythonDiscoveryResult> | null = null;
+   const PYTHON_STAGE_TTL_MS = 10 * 60 * 1000;
+   const MAX_PYTHON_STAGES = 32;
+-  const stagedPython = new Map<string, { pythonPath: string; validated: boolean; senderId: number; frameId: number; createdAt: number }>();
+-  const stagedRepairs = new Map<string, { plan: PythonRepairPlan; senderId: number; frameId: number; createdAt: number }>();
++  const stagedPython = new Map<
++    string,
++    { pythonPath: string; validated: boolean; senderId: number; frameId: number; createdAt: number }
++  >();
++  const stagedRepairs = new Map<
++    string,
++    { plan: PythonRepairPlan; senderId: number; frameId: number; createdAt: number }
++  >();
+   const prunePythonStages = () => {
+     const now = Date.now();
+-    for (const [token, value] of stagedPython) if (now - value.createdAt > PYTHON_STAGE_TTL_MS) stagedPython.delete(token);
+-    for (const [token, value] of stagedRepairs) if (now - value.createdAt > PYTHON_STAGE_TTL_MS) stagedRepairs.delete(token);
+-    while (stagedPython.size > MAX_PYTHON_STAGES) stagedPython.delete(stagedPython.keys().next().value!);
+-    while (stagedRepairs.size > MAX_PYTHON_STAGES) stagedRepairs.delete(stagedRepairs.keys().next().value!);
++    for (const [token, value] of stagedPython)
++      if (now - value.createdAt > PYTHON_STAGE_TTL_MS) stagedPython.delete(token);
++    for (const [token, value] of stagedRepairs)
++      if (now - value.createdAt > PYTHON_STAGE_TTL_MS) stagedRepairs.delete(token);
++    while (stagedPython.size > MAX_PYTHON_STAGES)
++      stagedPython.delete(stagedPython.keys().next().value!);
++    while (stagedRepairs.size > MAX_PYTHON_STAGES)
++      stagedRepairs.delete(stagedRepairs.keys().next().value!);
+   };
+   const stagePython = (pythonPath: string, event: IpcMainInvokeEvent, validated: boolean) => {
+     prunePythonStages();
+     const token = createOpaqueToken();
+-    stagedPython.set(token, { pythonPath, validated, senderId: event.sender.id, frameId: event.frameId, createdAt: Date.now() });
++    stagedPython.set(token, {
++      pythonPath,
++      validated,
++      senderId: event.sender.id,
++      frameId: event.frameId,
++      createdAt: Date.now(),
++    });
+     return token;
+   };
+   const consumeStage = (token: unknown, event: IpcMainInvokeEvent) => {
+@@ -408,7 +436,8 @@ export function registerIpc(
+     if (typeof token !== 'string') throw new Error('invalid_python_confirmation');
+     const staged = stagedPython.get(token);
+     stagedPython.delete(token);
+-    if (!staged || staged.senderId !== event.sender.id || staged.frameId !== event.frameId) throw new Error('python_confirmation_expired');
++    if (!staged || staged.senderId !== event.sender.id || staged.frameId !== event.frameId)
++      throw new Error('python_confirmation_expired');
+     if (!staged.validated) throw new Error('python_runtime_not_validated');
+     return staged;
+   };
+@@ -436,17 +465,19 @@ export function registerIpc(
+     const owner = getMainWindow();
+     assertTrustedMainFrame(event, owner);
+     if (!discoveryInFlight) {
+-      discoveryInFlight = discoverPythonRuntimes().then((result) => {
+-        // The discovery result is informational. It is not a compatibility check.
+-        discoveredPythonPaths = new Set(
+-          result.candidates
+-            .filter((candidate) => isAbsolute(candidate.pythonPath))
+-            .map((candidate) => resolve(candidate.pythonPath)),
+-        );
+-        return result;
+-      }).finally(() => {
+-        discoveryInFlight = null;
+-      });
++      discoveryInFlight = discoverPythonRuntimes()
++        .then((result) => {
++          // The discovery result is informational. It is not a compatibility check.
++          discoveredPythonPaths = new Set(
++            result.candidates
++              .filter((candidate) => isAbsolute(candidate.pythonPath))
++              .map((candidate) => resolve(candidate.pythonPath)),
++          );
++          return result;
++        })
++        .finally(() => {
++          discoveryInFlight = null;
++        });
+     }
+     return discoveryInFlight;
+   });
+@@ -455,7 +486,8 @@ export function registerIpc(
+     assertTrustedMainFrame(event, owner);
+     if (typeof raw !== 'string' || !isAbsolute(raw)) throw new Error('Invalid Python runtime path');
+     const pythonPath = resolve(raw);
+-    if (!discoveredPythonPaths.has(pythonPath)) throw new Error('Python runtime was not discovered; search again');
++    if (!discoveredPythonPaths.has(pythonPath))
++      throw new Error('Python runtime was not discovered; search again');
+     const validation = await validatePythonRuntime(pythonPath, backendRoot());
+     return { ...validation, token: stagePython(pythonPath, event, validation.ok) };
+   });
+@@ -475,12 +507,18 @@ export function registerIpc(
+     if (typeof raw !== 'string') throw new Error('Python selection token is required');
+     prunePythonStages();
+     const staged = stagedPython.get(raw);
+-    if (!staged || staged.senderId !== event.sender.id || staged.frameId !== event.frameId) throw new Error('python_selection_expired');
++    if (!staged || staged.senderId !== event.sender.id || staged.frameId !== event.frameId)
++      throw new Error('python_selection_expired');
+     const validation = await validatePythonRuntime(staged.pythonPath, backendRoot());
+     if (!validation.repairPlan) return validation;
+     prunePythonStages();
+     const repairToken = createOpaqueToken();
+-    stagedRepairs.set(repairToken, { plan: validation.repairPlan, senderId: event.sender.id, frameId: event.frameId, createdAt: Date.now() });
++    stagedRepairs.set(repairToken, {
++      plan: validation.repairPlan,
++      senderId: event.sender.id,
++      frameId: event.frameId,
++      createdAt: Date.now(),
++    });
+     return { ...validation, repairToken };
+   });
+   ipcMain.handle(CHANNELS.backendInstallPythonRepair, async (event, raw: unknown) => {
+@@ -488,24 +526,48 @@ export function registerIpc(
+     assertTrustedMainFrame(event, owner);
+     if (!raw || typeof raw !== 'object') throw new Error('Invalid Python repair confirmation');
+     const input = raw as { token?: unknown; pythonPath?: unknown; packages?: unknown };
+-    if (typeof input.token !== 'string' || typeof input.pythonPath !== 'string' || !Array.isArray(input.packages) || input.packages.some((p) => typeof p !== 'string'))
++    if (
++      typeof input.token !== 'string' ||
++      typeof input.pythonPath !== 'string' ||
++      !Array.isArray(input.packages) ||
++      input.packages.some((p) => typeof p !== 'string')
++    )
+       throw new Error('Explicit confirmation of the exact Python repair is required');
+     prunePythonStages();
+     const staged = stagedRepairs.get(input.token);
+-    if (!staged || staged.senderId !== event.sender.id || staged.frameId !== event.frameId) throw new Error('python_repair_expired');
+-    if (resolve(input.pythonPath) !== staged.plan.interpreter || JSON.stringify(input.packages) !== JSON.stringify(staged.plan.packages)) throw new Error('python_repair_changed');
++    if (!staged || staged.senderId !== event.sender.id || staged.frameId !== event.frameId)
++      throw new Error('python_repair_expired');
++    if (
++      resolve(input.pythonPath) !== staged.plan.interpreter ||
++      JSON.stringify(input.packages) !== JSON.stringify(staged.plan.packages)
++    )
++      throw new Error('python_repair_changed');
+     const recheck = await validatePythonRuntime(staged.plan.interpreter, backendRoot());
+-    if (recheck.ok || !recheck.repairPlan || JSON.stringify(recheck.repairPlan) !== JSON.stringify(staged.plan)) throw new Error('python_repair_changed');
++    if (
++      recheck.ok ||
++      !recheck.repairPlan ||
++      JSON.stringify(recheck.repairPlan) !== JSON.stringify(staged.plan)
++    )
++      throw new Error('python_repair_changed');
+     // The renderer supplies only translated labels; the interpreter and packages
+     // shown come from the trusted staged plan.
+     const labels = pythonRepairDialogLabels((raw as { dialog?: unknown }).dialog);
+     const choice = await dialog.showMessageBox(owner, {
+-      type: 'question', buttons: [labels.install, labels.cancel], defaultId: 0, cancelId: 1,
++      type: 'question',
++      buttons: [labels.install, labels.cancel],
++      defaultId: 0,
++      cancelId: 1,
+       title: labels.title,
+       message: labels.message,
+       detail: `${staged.plan.interpreter}\n\n${staged.plan.packages.join('\n')}`,
+     });
+-    if (choice.response !== 0) return { ...recheck, installed: false, canceled: true, token: stagePython(recheck.pythonPath, event, false) };
++    if (choice.response !== 0)
++      return {
++        ...recheck,
++        installed: false,
++        canceled: true,
++        token: stagePython(recheck.pythonPath, event, false),
++      };
+     if (maintenanceBusy) throw new Error('maintenance_busy');
+     maintenanceBusy = true;
+     stagedRepairs.delete(input.token);
+@@ -513,9 +575,32 @@ export function registerIpc(
+     let installError: unknown;
+     try {
+       const finalCheck = await validatePythonRuntime(staged.plan.interpreter, backendRoot());
+-      if (finalCheck.ok || !finalCheck.repairPlan || JSON.stringify(finalCheck.repairPlan) !== JSON.stringify(staged.plan)) throw new Error('python_repair_changed');
++      if (
++        finalCheck.ok ||
++        !finalCheck.repairPlan ||
++        JSON.stringify(finalCheck.repairPlan) !== JSON.stringify(staged.plan)
++      )
++        throw new Error('python_repair_changed');
+       try {
+-        output = await runRuntimeProbe(staged.plan.interpreter, ['-m', 'pip', 'install', '--disable-pip-version-check', '--no-input', ...staged.plan.packages], backendRoot(), sanitizedPythonEnvironment(), { timeoutMs: 15 * 60 * 1000, captureStderr: true, onOutput: (text, stream) => sendToLiveWindow(owner, CHANNELS.backendPythonRepairProgress, { text, stream }) });
++        output = await runRuntimeProbe(
++          staged.plan.interpreter,
++          [
++            '-m',
++            'pip',
++            'install',
++            '--disable-pip-version-check',
++            '--no-input',
++            ...staged.plan.packages,
++          ],
++          backendRoot(),
++          sanitizedPythonEnvironment(),
++          {
++            timeoutMs: 15 * 60 * 1000,
++            captureStderr: true,
++            onOutput: (text, stream) =>
++              sendToLiveWindow(owner, CHANNELS.backendPythonRepairProgress, { text, stream }),
++          },
++        );
+       } catch (error) {
+         installError = error;
+         const failure = error as { stdout?: unknown; stderr?: unknown; message?: unknown };
+@@ -527,12 +612,28 @@ export function registerIpc(
+     const after = await validatePythonRuntime(staged.plan.interpreter, backendRoot());
+     if (!after.ok && after.repairPlan) {
+       const repairToken = createOpaqueToken();
+-      stagedRepairs.set(repairToken, { plan: after.repairPlan, senderId: event.sender.id, frameId: event.frameId, createdAt: Date.now() });
++      stagedRepairs.set(repairToken, {
++        plan: after.repairPlan,
++        senderId: event.sender.id,
++        frameId: event.frameId,
++        createdAt: Date.now(),
++      });
+       // A fresh unvalidated selection token keeps "Review dependency installation"
+       // available for the next missing dependency without choosing the interpreter again.
+-      return { ...after, installed: false, repairToken, token: stagePython(after.pythonPath, event, false), outputTail: output.slice(-4000) };
++      return {
++        ...after,
++        installed: false,
++        repairToken,
++        token: stagePython(after.pythonPath, event, false),
++        outputTail: output.slice(-4000),
++      };
+     }
+-    return { ...after, installed: after.ok && !installError, token: after.ok && !installError ? stagePython(after.pythonPath, event, true) : undefined, outputTail: output.slice(-4000) };
++    return {
++      ...after,
++      installed: after.ok && !installError,
++      token: after.ok && !installError ? stagePython(after.pythonPath, event, true) : undefined,
++      outputTail: output.slice(-4000),
++    };
+   });
+   ipcMain.handle(CHANNELS.backendHostSnapshot, (event) => {
+     const owner = getMainWindow();
+@@ -742,18 +843,21 @@ export function registerIpc(
+       overrideActive: Boolean(String(process.env.OMNIVOICE_BACKEND_CMD ?? '').trim()),
+     };
+   });
+-  ipcMain.handle(CHANNELS.backendChoosePythonRuntime, async (event: IpcMainInvokeEvent, rawTitle: unknown) => {
+-    const owner = getMainWindow();
+-    assertTrustedMainFrame(event, owner);
+-    const title = typeof rawTitle === 'string' && rawTitle.length <= 200 ? rawTitle : undefined;
+-    const picked = await dialog.showOpenDialog(owner, {
+-      ...(title ? { title } : {}),
+-      properties: ['openFile'],
+-    });
+-    if (picked.canceled || !picked.filePaths[0]) return { ok: false, canceled: true };
+-    const validation = await validatePythonRuntime(picked.filePaths[0], backendRoot());
+-    return { ...validation, token: stagePython(validation.pythonPath, event, validation.ok) };
+-  });
++  ipcMain.handle(
++    CHANNELS.backendChoosePythonRuntime,
++    async (event: IpcMainInvokeEvent, rawTitle: unknown) => {
++      const owner = getMainWindow();
++      assertTrustedMainFrame(event, owner);
++      const title = typeof rawTitle === 'string' && rawTitle.length <= 200 ? rawTitle : undefined;
++      const picked = await dialog.showOpenDialog(owner, {
++        ...(title ? { title } : {}),
++        properties: ['openFile'],
++      });
++      if (picked.canceled || !picked.filePaths[0]) return { ok: false, canceled: true };
++      const validation = await validatePythonRuntime(picked.filePaths[0], backendRoot());
++      return { ...validation, token: stagePython(validation.pythonPath, event, validation.ok) };
++    },
++  );
+   ipcMain.handle(CHANNELS.backendUseManagedPython, async (event: IpcMainInvokeEvent) => {
+     const owner = getMainWindow();
+     assertTrustedMainFrame(event, owner);
+@@ -802,20 +906,50 @@ export function registerIpc(
+     }
+     return authorizeModelsDirectory(await backendDataDirectory(supervisor), selected);
+   });
+-  ipcMain.handle(CHANNELS.filesChooseEngineModelDirectory, async (event: IpcMainInvokeEvent, raw: unknown) => {
+-    const owner = getMainWindow();
++  ipcMain.handle(
++    CHANNELS.filesChooseEngineModelDirectory,
++    async (event: IpcMainInvokeEvent, raw: unknown) => {
++      const owner = getMainWindow();
++      assertTrustedMainFrame(event, owner);
++      if (supervisor.connection.remote)
++        throw new Error('Local model selection requires a local backend');
++      if (typeof raw !== 'string' || !['omnivoice', 'mlx-audio'].includes(raw))
++        throw new Error('Unsupported engine local model selector');
++      const picked = await dialog.showOpenDialog(
++        owner,
++        securityScopedDialogOptions<Electron.OpenDialogOptions>({ properties: ['openDirectory'] }),
++      );
++      if (picked.canceled || !picked.filePaths[0]) return null;
++      retainSecurityScopedDirectory(picked);
++      const dataDirectory = await backendDataDirectory(supervisor);
++      if (supervisor.connection.remote)
++        throw new Error('Local model selection requires a local backend');
++      return authorizeModelsDirectoryReadOnly(dataDirectory, picked.filePaths[0], raw);
++    },
++  );
++
++  const batchDirectories = new Map<string, { directory: string; bookmark?: string }>();
++  ipcMain.handle('files:beginBatchExport', async (event): Promise<string | null> => {
++    const owner = windowFor(event) ?? getMainWindow();
+     assertTrustedMainFrame(event, owner);
+-    if (supervisor.connection.remote) throw new Error('Local model selection requires a local backend');
+-    if (typeof raw !== 'string' || !['omnivoice', 'mlx-audio'].includes(raw))
+-      throw new Error('Unsupported engine local model selector');
+-    const picked = await dialog.showOpenDialog(owner,
+-      securityScopedDialogOptions<Electron.OpenDialogOptions>({ properties: ['openDirectory'] }),
++    const picked = await dialog.showOpenDialog(
++      owner,
++      securityScopedDialogOptions<Electron.OpenDialogOptions>({
++        properties: ['openDirectory', 'createDirectory'],
++      }),
+     );
+     if (picked.canceled || !picked.filePaths[0]) return null;
+-    retainSecurityScopedDirectory(picked);
+-    const dataDirectory = await backendDataDirectory(supervisor);
+-    if (supervisor.connection.remote) throw new Error('Local model selection requires a local backend');
+-    return authorizeModelsDirectoryReadOnly(dataDirectory, picked.filePaths[0], raw);
++    const token = randomUUID();
++    batchDirectories.set(token, {
++      directory: picked.filePaths[0],
++      bookmark: picked.bookmarks?.[0],
++    });
++    return token;
++  });
++  ipcMain.handle('files:endBatchExport', (event, raw: unknown) => {
++    const owner = windowFor(event) ?? getMainWindow();
++    assertTrustedMainFrame(event, owner);
++    batchDirectories.delete(assertString(raw, 'batch token'));
+   });
+ 
+   ipcMain.handle(CHANNELS.filesSaveAudio, async (event, raw: unknown): Promise<SaveAudioResult> => {
+@@ -823,13 +957,25 @@ export function registerIpc(
+     assertTrustedMainFrame(event, owner);
+     const req = assertSaveAudioRequest(raw);
+     const source = resolveBackendDownloadUrl(req.url, supervisor.baseUrl);
++    const subtitleSource = req.subtitleUrl
++      ? resolveBackendDownloadUrl(req.subtitleUrl, supervisor.baseUrl)
++      : null;
+     const options = securityScopedDialogOptions<Electron.SaveDialogOptions>({
+       defaultPath: req.suggestedName,
+       filters: saveFiltersFor(req.suggestedName),
+     });
+-    const picked = owner
+-      ? await dialog.showSaveDialog(owner, options)
+-      : await dialog.showSaveDialog(options);
++    const batch = req.batchToken ? batchDirectories.get(req.batchToken) : null;
++    if (req.batchToken && !batch) throw new Error('Invalid or expired batch export');
++    if (batch && !subtitleSource) throw new Error('Batch exports require an audio and SRT pair');
++    const picked = batch
++      ? {
++          canceled: false,
++          filePath: join(batch.directory, req.suggestedName),
++          bookmark: batch.bookmark,
++        }
++      : owner
++        ? await dialog.showSaveDialog(owner, options)
++        : await dialog.showSaveDialog(options);
+     if (picked.canceled || !picked.filePath) return { canceled: true };
+     const res = await net.fetch(source, {
+       method: req.method ?? 'GET',
+@@ -837,9 +983,20 @@ export function registerIpc(
+       bypassCustomProtocolHandlers: true,
+     });
+     if (!res.ok) throw new Error(await downloadFailureMessage(res));
+-    await withSecurityScopedBookmark(picked.bookmark, async () =>
+-      replaceFile(picked.filePath, Buffer.from(await res.arrayBuffer())),
+-    );
++    const audio = Buffer.from(await res.arrayBuffer());
++    if (subtitleSource) {
++      const subtitle = await net.fetch(subtitleSource, {
++        headers: supervisor.requestHeaders(),
++        bypassCustomProtocolHandlers: true,
++      });
++      if (!subtitle.ok) throw new Error(await downloadFailureMessage(subtitle));
++      const srt = Buffer.from(await subtitle.arrayBuffer());
++      await withSecurityScopedBookmark(picked.bookmark, () =>
++        saveAudioSubtitlePair(picked.filePath!, audio, srt),
++      );
++    } else {
++      await withSecurityScopedBookmark(picked.bookmark, () => replaceFile(picked.filePath, audio));
++    }
+     return { canceled: false, path: picked.filePath };
+   });
+ 
+diff --git a/electron/src/main/save-audio-subtitle-pair.test.ts b/electron/src/main/save-audio-subtitle-pair.test.ts
+new file mode 100644
+index 0000000..4327dd5
+--- /dev/null
++++ b/electron/src/main/save-audio-subtitle-pair.test.ts
+@@ -0,0 +1,46 @@
++import { mkdtemp, readFile, writeFile, readdir, rm } from 'node:fs/promises';
++import { join } from 'node:path';
++import { tmpdir } from 'node:os';
++import { afterEach, expect, it } from 'vitest';
++import { saveAudioSubtitlePair } from './save-audio-subtitle-pair';
++
++const dirs: string[] = [];
++afterEach(async () => {
++  await Promise.all(dirs.splice(0).map((p) => rm(p, { recursive: true, force: true })));
++});
++async function folder() {
++  const dir = await mkdtemp(join(tmpdir(), 'pair-'));
++  dirs.push(dir);
++  return dir;
++}
++const bytes = (s: string) => new TextEncoder().encode(s);
++it.each(['wav', 'mp3'])('saves the same basename as %s plus SRT', async (format) => {
++  const dir = await folder();
++  await saveAudioSubtitlePair(join(dir, `Bai_01.${format}`), bytes('audio'), bytes('subtitle'));
++  expect(await readFile(join(dir, 'Bai_01.srt'), 'utf8')).toBe('subtitle');
++  expect(await readFile(join(dir, `Bai_01.${format}`), 'utf8')).toBe('audio');
++});
++it('preserves an existing subtitle and rolls back the newly created audio', async () => {
++  const dir = await folder();
++  await writeFile(join(dir, 'Bai_01.srt'), 'existing');
++  await expect(
++    saveAudioSubtitlePair(join(dir, 'Bai_01.wav'), bytes('new'), bytes('new')),
++  ).rejects.toThrow();
++  expect(await readdir(dir)).toEqual(['Bai_01.srt']);
++  expect(await readFile(join(dir, 'Bai_01.srt'), 'utf8')).toBe('existing');
++});
++it('does not overwrite audio or publish its subtitle when audio already exists', async () => {
++  const dir = await folder();
++  await writeFile(join(dir, 'Bai_01.wav'), 'existing');
++  await expect(
++    saveAudioSubtitlePair(join(dir, 'Bai_01.wav'), bytes('new'), bytes('new')),
++  ).rejects.toThrow();
++  expect(await readdir(dir)).toEqual(['Bai_01.wav']);
++});
++it('rejects a misleading extension before writing either file', async () => {
++  const dir = await folder();
++  await expect(
++    saveAudioSubtitlePair(join(dir, 'Bai_01.srt'), bytes('audio'), bytes('srt')),
++  ).rejects.toThrow();
++  expect(await readdir(dir)).toEqual([]);
++});
+diff --git a/electron/src/main/save-audio-subtitle-pair.ts b/electron/src/main/save-audio-subtitle-pair.ts
+new file mode 100644
+index 0000000..4ed3676
+--- /dev/null
++++ b/electron/src/main/save-audio-subtitle-pair.ts
+@@ -0,0 +1,29 @@
++import { open, unlink } from 'node:fs/promises';
++import { extname } from 'node:path';
++
++/** Never overwrite either half of a pair. Roll back files created by a failed save. */
++export async function saveAudioSubtitlePair(path: string, audio: Uint8Array, srt: Uint8Array) {
++  const extension = extname(path);
++  if (!['.wav', '.mp3'].includes(extension.toLowerCase()))
++    throw new Error('Choose a WAV or MP3 filename for the audio and SRT pair.');
++  const subtitle = path.slice(0, -extension.length) + '.srt';
++  const created: string[] = [];
++  try {
++    for (const [name, data] of [
++      [path, audio],
++      [subtitle, srt],
++    ] as const) {
++      const handle = await open(name, 'wx');
++      created.push(name);
++      try {
++        await handle.writeFile(data);
++        await handle.sync();
++      } finally {
++        await handle.close();
++      }
++    }
++  } catch (error) {
++    await Promise.all(created.map((name) => unlink(name).catch(() => {})));
++    throw error;
++  }
++}
+diff --git a/electron/src/preload/index.d.ts b/electron/src/preload/index.d.ts
+index 946d1ae..2b07e56 100644
+--- a/electron/src/preload/index.d.ts
++++ b/electron/src/preload/index.d.ts
+@@ -148,7 +148,10 @@ export interface PythonDiscoveryResult {
+   partial: boolean;
+   scannedRoots: string[];
+ }
+-export interface PythonRepairPlan { interpreter: string; packages: string[]; }
++export interface PythonRepairPlan {
++  interpreter: string;
++  packages: string[];
++}
+ 
+ export interface BackendConnection {
+   remote: boolean;
+@@ -210,6 +213,8 @@ export type RemoteBackendProbe =
+     };
+ 
+ export interface SaveAudioRequest {
++  subtitleUrl?: string;
++  batchToken?: string;
+   /** App-relative API path (`/api/audio/<id>.wav`) or an absolute backend URL.
+    *  Main resolves app-relative paths against the live backend base. */
+   url: string;
+@@ -565,7 +570,9 @@ export interface VoiceStudioBridge {
+       repairPlan?: PythonRepairPlan;
+       outputTail?: string;
+     }>;
+-    onPythonRepairProgress(callback: (event: { text: string; stream: 'stdout' | 'stderr' }) => void): () => void;
++    onPythonRepairProgress(
++      callback: (event: { text: string; stream: 'stdout' | 'stderr' }) => void,
++    ): () => void;
+     useManagedPython(): Promise<{ ok: boolean }>;
+     discoverPythonRuntimes(): Promise<PythonDiscoveryResult>;
+     useDiscoveredPythonRuntime(pythonPath: string): Promise<{
+@@ -626,9 +633,13 @@ export interface VoiceStudioBridge {
+     authorizeMediaTool(kind: 'ffmpeg' | 'ffprobe'): Promise<AuthorizedPathSelection | null>;
+     /** Authorize a chosen model cache directory, or the platform default when reset is true. */
+     authorizeModelsDirectory(reset?: boolean): Promise<AuthorizedPathSelection | null>;
+-    chooseEngineModelDirectory(engineId: 'omnivoice' | 'mlx-audio'): Promise<AuthorizedPathSelection | null>;
++    chooseEngineModelDirectory(
++      engineId: 'omnivoice' | 'mlx-audio',
++    ): Promise<AuthorizedPathSelection | null>;
+     extractScript(input: { name: string; data: Uint8Array }): Promise<string>;
+     /** Native "Save as…" for a generated take: main fetches the URL and writes the file. */
++    beginBatchExport(): Promise<string | null>;
++    endBatchExport(token: string): Promise<void>;
+     saveAudio(req: SaveAudioRequest): Promise<SaveAudioResult>;
+     saveData(req: SaveDataRequest): Promise<SaveAudioResult>;
+     /** Reveal an absolute path in Finder / Explorer / file manager. */
+diff --git a/electron/src/preload/index.ts b/electron/src/preload/index.ts
+index e14ced8..8e6e97b 100644
+--- a/electron/src/preload/index.ts
++++ b/electron/src/preload/index.ts
+@@ -114,17 +114,19 @@ const bridge: VoiceStudioBridge = {
+     setRuntimeRegion: (region) => ipcRenderer.invoke('backend:setRuntimeRegion', region),
+     chooseRuntimeLocation: (title) => ipcRenderer.invoke('backend:chooseRuntimeLocation', title),
+     useDefaultRuntimeLocation: () => ipcRenderer.invoke('backend:useDefaultRuntimeLocation'),
+-    getPythonRuntime: () => ipcRenderer.invoke('backend:getPythonRuntime') as Promise<{
+-      selection: { pythonPath: string } | null;
+-      overrideActive: boolean;
+-    }>,
++    getPythonRuntime: () =>
++      ipcRenderer.invoke('backend:getPythonRuntime') as Promise<{
++        selection: { pythonPath: string } | null;
++        overrideActive: boolean;
++      }>,
+     choosePythonRuntime: (title) => ipcRenderer.invoke('backend:choosePythonRuntime', title),
+     confirmPythonRuntime: (token) => ipcRenderer.invoke('backend:confirmPythonRuntime', token),
+     planPythonRepair: (pythonPath) => ipcRenderer.invoke('backend:planPythonRepair', pythonPath),
+     installPythonRepair: (request) => ipcRenderer.invoke('backend:installPythonRepair', request),
+     onPythonRepairProgress: (callback) => subscribe('backend:pythonRepairProgress', callback),
+     useManagedPython: () => ipcRenderer.invoke('backend:useManagedPython'),
+-    discoverPythonRuntimes: () => ipcRenderer.invoke('backend:discoverPythonRuntimes') as Promise<PythonDiscoveryResult>,
++    discoverPythonRuntimes: () =>
++      ipcRenderer.invoke('backend:discoverPythonRuntimes') as Promise<PythonDiscoveryResult>,
+     useDiscoveredPythonRuntime: (pythonPath) =>
+       ipcRenderer.invoke('backend:useDiscoveredPythonRuntime', pythonPath),
+     restart: () => ipcRenderer.invoke('backend:restart') as Promise<void>,
+@@ -175,6 +177,8 @@ const bridge: VoiceStudioBridge = {
+     chooseEngineModelDirectory: (engineId) =>
+       ipcRenderer.invoke('files:chooseEngineModelDirectory', engineId),
+     extractScript: (input) => ipcRenderer.invoke('files:extractScript', input) as Promise<string>,
++    beginBatchExport: () => ipcRenderer.invoke('files:beginBatchExport') as Promise<string | null>,
++    endBatchExport: (token) => ipcRenderer.invoke('files:endBatchExport', token) as Promise<void>,
+     saveAudio: (req: SaveAudioRequest) =>
+       ipcRenderer.invoke('files:saveAudio', req) as Promise<SaveAudioResult>,
+     saveData: (req) => ipcRenderer.invoke('files:saveData', req) as Promise<SaveAudioResult>,
+diff --git a/electron/src/renderer/src/components/save-audio-button.test.tsx b/electron/src/renderer/src/components/save-audio-button.test.tsx
+index bd9dc9e..f1259fc 100644
+--- a/electron/src/renderer/src/components/save-audio-button.test.tsx
++++ b/electron/src/renderer/src/components/save-audio-button.test.tsx
+@@ -49,3 +49,9 @@ it('only derives an MP3 URL for backend renders', () => {
+   expect(audioMp3Url('../secret.wav')).toBeUndefined();
+   expect(audioMp3Url('ab12cd34.flac')).toBeUndefined();
+ });
++
++it('saves the matching SRT through the same existing download button', async () => {
++  render(<SaveAudioButton url="/audio/ab12cd34.wav" subtitleUrl="/audio/ab12cd34.srt" suggestedName="Bai_01.wav" />);
++  fireEvent.click(screen.getByRole('button', { name: 'clone.download_pair' }));
++  await waitFor(() => expect(mocks.saveExport).toHaveBeenCalledWith('/audio/ab12cd34.wav', 'Bai_01.wav', '/audio/ab12cd34.srt'));
++});
+diff --git a/electron/src/renderer/src/components/save-audio-button.tsx b/electron/src/renderer/src/components/save-audio-button.tsx
+index 08b4054..8e1e7e0 100644
+--- a/electron/src/renderer/src/components/save-audio-button.tsx
++++ b/electron/src/renderer/src/components/save-audio-button.tsx
+@@ -15,6 +15,7 @@ import { cn } from '@/lib/utils';
+ export function SaveAudioButton({
+   url,
+   mp3Url,
++  subtitleUrl,
+   suggestedName,
+   disabled = false,
+   iconOnly = false,
+@@ -22,6 +23,7 @@ export function SaveAudioButton({
+   url?: string;
+   /** When set, a format menu beside the button also offers an MP3 export. */
+   mp3Url?: string;
++  subtitleUrl?: string;
+   suggestedName: string;
+   disabled?: boolean;
+   /** A compact secondary action: the label becomes the tooltip. */
+@@ -36,7 +38,7 @@ export function SaveAudioButton({
+     if (!target || !bridge) return;
+     setSaving(true);
+     try {
+-      const saved = await saveExport(target, name);
++      const saved = await (subtitleUrl ? saveExport(target, name, subtitleUrl) : saveExport(target, name));
+       if (!saved) return;
+       if (!saved.canceled && saved.path) {
+         const path = saved.path;
+@@ -70,7 +72,7 @@ export function SaveAudioButton({
+       disabled={off}
+     >
+       <DownloadIcon />
+-      {iconOnly ? null : t('clone.download')}
++      {iconOnly ? null : t(subtitleUrl ? 'clone.download_pair' : 'clone.download')}
+     </Button>
+   );
+   if (!mp3Url) return button;
+diff --git a/electron/src/renderer/src/features/clone/action-bar.tsx b/electron/src/renderer/src/features/clone/action-bar.tsx
+index addf7bf..0691df4 100644
+--- a/electron/src/renderer/src/features/clone/action-bar.tsx
++++ b/electron/src/renderer/src/features/clone/action-bar.tsx
+@@ -209,6 +209,7 @@ function Overrides({ settings }: OverridesProps) {
+               id={durationId}
+               inputMode="decimal"
+               value={settings.duration}
++              disabled={settings.subtitleLines}
+               onChange={(event) => setCloneSetting('duration', event.target.value)}
+               placeholder={t('clone.auto')}
+               className="h-7 text-xs tabular-nums"
+@@ -326,6 +327,7 @@ export function ActionBar({ setup: shared }: { setup?: EngineSetup } = {}) {
+     generate,
+     cancel,
+     isGenerating,
++    batchProgress,
+     elapsedSeconds,
+     progress,
+     stage,
+@@ -374,6 +376,11 @@ export function ActionBar({ setup: shared }: { setup?: EngineSetup } = {}) {
+         />
+       )}
+       {!demo && !isGenerating && <ExpressionTip />}
++      {batchProgress && (
++        <p role="status" className="truncate text-xs text-muted-foreground">
++          {batchProgress.index}/{batchProgress.total} · {batchProgress.sourceName}.txt
++        </p>
++      )}
+       <div className="flex flex-wrap items-center gap-3">
+         <div className="flex items-center gap-1 rounded-lg bg-background/50 p-1 ring-1 ring-border/50">
+           <EngineLanguagePicker />
+diff --git a/electron/src/renderer/src/features/clone/output-panel.tsx b/electron/src/renderer/src/features/clone/output-panel.tsx
+index 87a85b8..3529f3a 100644
+--- a/electron/src/renderer/src/features/clone/output-panel.tsx
++++ b/electron/src/renderer/src/features/clone/output-panel.tsx
+@@ -41,7 +41,8 @@ export function OutputPanel() {
+             <SaveAudioButton
+               url={result.audioPath ? audioUrl(result.audioPath) : undefined}
+               mp3Url={result.audioPath ? audioMp3Url(result.audioPath) : undefined}
+-              suggestedName={`voicestudio-${result.id ?? stamp}.wav`}
++              suggestedName={`${result.sourceName || `voicestudio-${result.id ?? stamp}`}.wav`}
++              subtitleUrl={result.subtitlePath ? audioUrl(result.subtitlePath) : undefined}
+             />
+             <Button
+               variant="ghost"
+diff --git a/electron/src/renderer/src/features/clone/script-panel.tsx b/electron/src/renderer/src/features/clone/script-panel.tsx
+index 3c2b68e..c3f8a91 100644
+--- a/electron/src/renderer/src/features/clone/script-panel.tsx
++++ b/electron/src/renderer/src/features/clone/script-panel.tsx
+@@ -20,6 +20,7 @@ import { KNOWN_TAGS, engineShortName, expressionCaps } from '@/lib/expression';
+ import { setCloneSetting, useCloneSetting } from '@/lib/store/clone-settings';
+ import { cn } from '@/lib/utils';
+ import { SectionLabel } from './section-label';
++import { useCloneScripts, setCloneScripts } from '@/lib/store/clone-scripts';
+ 
+ export function ScriptPanel({
+   voiceName,
+@@ -28,6 +29,9 @@ export function ScriptPanel({
+ }: { voiceName?: string; coachmark?: string; onUserEdit?: () => void } = {}) {
+   const { t } = useTranslation();
+   const text = useCloneSetting('text');
++  const subtitleLines = useCloneSetting('subtitleLines');
++  const scripts = useCloneScripts();
++  const batchAudioFormat = useCloneSetting('batchAudioFormat');
+   const { activeTts } = useEngines();
+   // Offer the engine's own reaction tags; any other engine would speak them as words.
+   const engineTags = expressionCaps(activeTts).tags;
+@@ -155,18 +159,41 @@ export function ScriptPanel({
+             <input
+               ref={importRef}
+               type="file"
++              multiple
+               className="sr-only"
+               accept={SCRIPT_ACCEPT}
+               aria-label={t('scriptEdit.import')}
+               onChange={async (event) => {
+-                const file = event.target.files?.[0];
++                const files = Array.from(event.target.files ?? []);
+                 event.target.value = '';
+-                if (!file) return;
++                if (!files.length) return;
++                const file = files[0];
+                 const before = textareaRef.current?.value;
+                 setPasting(true);
+                 try {
+-                  const imported = await importScript(file);
+-                  if (textareaRef.current?.value === before) edit(imported);
++                  if (files.length > 1 && files.some((item) => !/\.txt$/i.test(item.name)))
++                    throw new Error('Batch import requires TXT files');
++                  const ordered =
++                    files.length > 1
++                      ? [...files].sort((a, b) =>
++                          a.name.localeCompare(b.name, undefined, { numeric: true }),
++                        )
++                      : files;
++                  const imported = await Promise.all(
++                    ordered.map(async (item) => ({
++                      sourceName: item.name.replace(/\.[^.]+$/, ''),
++                      text: await importScript(item),
++                    })),
++                  );
++                  const names = imported.map((item) => item.sourceName.toLowerCase());
++                  if (new Set(names).size !== names.length) throw new Error('Duplicate TXT names');
++                  if (textareaRef.current?.value === before) {
++                    edit(imported[0].text, true);
++                    setCloneScripts(imported.length > 1 ? imported : []);
++                    setCloneSetting('sourceName', imported[0].sourceName);
++                    setCloneSetting('subtitleLines', /\.txt$/i.test(file.name));
++                    if (/\.txt$/i.test(file.name)) setCloneSetting('duration', '');
++                  }
+                 } catch {
+                   toast.error(t('scriptEdit.import_failed'));
+                 } finally {
+@@ -352,6 +379,46 @@ export function ScriptPanel({
+             <span>{coachmark}</span>
+           </div>
+         ) : null}
++        <label className="flex items-center gap-2 text-sm text-muted-foreground">
++          <input
++            type="checkbox"
++            checked={subtitleLines}
++            disabled={scripts.length > 1}
++            onChange={(event) => {
++              setCloneSetting('subtitleLines', event.target.checked);
++              if (event.target.checked) setCloneSetting('duration', '');
++            }}
++          />
++          {t('clone.line_subtitles')}
++        </label>
++        {scripts.length > 1 && (
++          <div className="space-y-2 rounded-lg border border-border p-3 text-sm">
++            <div className="flex items-center justify-between gap-2">
++              <span>{t('clone.batch_scripts', { count: scripts.length })}</span>
++              <Button variant="ghost" size="xs" onClick={() => setCloneScripts([])}>
++                {t('clone.batch_clear')}
++              </Button>
++            </div>
++            <ol className="max-h-24 list-inside list-decimal overflow-y-auto text-muted-foreground">
++              {scripts.map((script) => (
++                <li key={script.sourceName}>{script.sourceName}.txt</li>
++              ))}
++            </ol>
++            <div role="group" aria-label={t('clone.download_format')} className="flex gap-2">
++              {(['wav', 'mp3'] as const).map((format) => (
++                <Button
++                  key={format}
++                  variant={batchAudioFormat === format ? 'secondary' : 'outline'}
++                  size="xs"
++                  aria-pressed={batchAudioFormat === format}
++                  onClick={() => setCloneSetting('batchAudioFormat', format)}
++                >
++                  {format.toUpperCase()} + SRT
++                </Button>
++              ))}
++            </div>
++          </div>
++        )}
+         <Textarea
+           data-clone-script
+           ref={textareaRef}
+diff --git a/electron/src/renderer/src/features/clone/take-details.tsx b/electron/src/renderer/src/features/clone/take-details.tsx
+index 12fdf96..f75044a 100644
+--- a/electron/src/renderer/src/features/clone/take-details.tsx
++++ b/electron/src/renderer/src/features/clone/take-details.tsx
+@@ -206,7 +206,8 @@ export function TakeDetails({ item }: { item: HistoryItem }) {
+           <SaveAudioButton
+             url={audioUrl(item.audio_path)}
+             mp3Url={audioMp3Url(item.audio_path)}
+-            suggestedName={`voicestudio-${item.id}.wav`}
++            suggestedName={`${settings.sourceName || `voicestudio-${item.id}`}.wav`}
++            subtitleUrl={item.subtitle_path ? audioUrl(item.subtitle_path) : undefined}
+             iconOnly
+           />
+         )}
+diff --git a/electron/src/renderer/src/hooks/use-generate.test.tsx b/electron/src/renderer/src/hooks/use-generate.test.tsx
+index 8154371..7a1a1b2 100644
+--- a/electron/src/renderer/src/hooks/use-generate.test.tsx
++++ b/electron/src/renderer/src/hooks/use-generate.test.tsx
+@@ -8,6 +8,23 @@ import { generateClone } from '@/lib/api/generate';
+ import { setLatestOutput } from '@/lib/store/output';
+ import { queryKeys } from '@/lib/query';
+ import type { Profile } from '@/lib/api/types';
++import { setCloneScripts } from '@/lib/store/clone-scripts';
++const batchNative = vi.hoisted(() => ({
++  enabled: false,
++  begin: vi.fn(),
++  end: vi.fn(),
++  save: vi.fn(),
++}));
++vi.mock('@/components/bridge', async (importOriginal) => ({
++  ...(await importOriginal<typeof import('@/components/bridge')>()),
++  getBridge: () =>
++    batchNative.enabled
++      ? { files: { beginBatchExport: batchNative.begin, endBatchExport: batchNative.end } }
++      : null,
++}));
++vi.mock('@/lib/native-save', () => ({
++  saveBackendFile: (...args: unknown[]) => batchNative.save(...args),
++}));
+ const modelStatus = vi.hoisted(() => ({
+   value: { status: 'loading', loading: true } as {
+     status: string;
+@@ -71,6 +88,8 @@ function Consumer({ name }: { name: string }) {
+ describe('shared generation lifecycle', () => {
+   beforeEach(() => {
+     vi.clearAllMocks();
++    setCloneScripts([]);
++    batchNative.enabled = false;
+     modelStatus.value = { status: 'loading', loading: true };
+   });
+   it('keeps failures inline without a duplicate toast', async () => {
+@@ -685,11 +704,17 @@ it.each([
+   },
+ );
+ 
+-it.each([['clone', false], ['design', false], ['clone', true], ['design', true]] as const)(
++it.each([
++  ['clone', false],
++  ['design', false],
++  ['clone', true],
++  ['design', true],
++] as const)(
+   'clears the %s synthesis banner after acceptance (close while pending: %s)',
+   async (mode, closeWhilePending) => {
+     const { ApiError, apiJson } = await import('@/lib/api/client');
+-    const { announceModelLicenceRequired } = await import('@/features/settings/model-license-contract');
++    const { announceModelLicenceRequired } =
++      await import('@/features/settings/model-license-contract');
+     const { ModelLicenceGate } = await import('@/features/settings/model-licence-acceptance');
+     const { default: en } = await import('@/i18n/locales/en.json');
+     const { createInstance } = await import('i18next');
+@@ -702,7 +727,9 @@ it.each([['clone', false], ['design', false], ['clone', true], ['design', true]]
+     ];
+     const accepted = new Set<string>();
+     let releaseAcceptance!: () => void;
+-    const acceptanceReady = new Promise<void>((resolve) => { releaseAcceptance = resolve; });
++    const acceptanceReady = new Promise<void>((resolve) => {
++      releaseAcceptance = resolve;
++    });
+     if (!closeWhilePending) releaseAcceptance();
+     vi.mocked(apiJson).mockImplementation(async (path, init) => {
+       if (path === '/models/licenses/accept') {
+@@ -715,7 +742,11 @@ it.each([['clone', false], ['design', false], ['clone', true], ['design', true]]
+         const model = models.find((item) => path.endsWith(item.repo_id))!;
+         return {
+           repo_id: model.repo_id,
+-          info: { license: 'Test licence', credit: 'Test holder', license_category: model.category },
++          info: {
++            license: 'Test licence',
++            credit: 'Test holder',
++            license_category: model.category,
++          },
+           acceptance: { ...model, required: true, accepted: accepted.has(model.repo_id) },
+           history: [],
+         };
+@@ -723,24 +754,37 @@ it.each([['clone', false], ['design', false], ['clone', true], ['design', true]]
+       return modelStatus.value;
+     });
+     patchCloneSettings({ text: 'Hello', selectedProfileId: 'voice-1', autoPlay: false });
+-    vi.mocked(generateClone).mockReset().mockImplementationOnce(async () => {
+-      const payload = { detail: { code: 'model_licence_required', models } };
+-      announceModelLicenceRequired(payload);
+-      throw new ApiError(403, en.modelLicense.requiredError, payload);
+-    });
++    vi.mocked(generateClone)
++      .mockReset()
++      .mockImplementationOnce(async () => {
++        const payload = { detail: { code: 'model_licence_required', models } };
++        announceModelLicenceRequired(payload);
++        throw new ApiError(403, en.modelLicense.requiredError, payload);
++      });
+     function Synthesis() {
+       const state = useGenerateClone();
+-      return <>
+-        <button onClick={() => void (mode === 'clone'
+-          ? state.generate()
+-          : state.generateDesign({ text: 'Hello', instruct: 'male' }))}>Synthesize test</button>
+-        {state.error && <p role="alert">{state.error}</p>}
+-      </>;
++      return (
++        <>
++          <button
++            onClick={() =>
++              void (mode === 'clone'
++                ? state.generate()
++                : state.generateDesign({ text: 'Hello', instruct: 'male' }))
++            }
++          >
++            Synthesize test
++          </button>
++          {state.error && <p role="alert">{state.error}</p>}
++        </>
++      );
+     }
+     const view = render(
+       <QueryClientProvider client={new QueryClient()}>
+         <I18nextProvider i18n={i18n}>
+-          <GenerationProvider><Synthesis /><ModelLicenceGate /></GenerationProvider>
++          <GenerationProvider>
++            <Synthesis />
++            <ModelLicenceGate />
++          </GenerationProvider>
+         </I18nextProvider>
+       </QueryClientProvider>,
+     );
+@@ -750,7 +794,9 @@ it.each([['clone', false], ['design', false], ['clone', true], ['design', true]]
+       const boxes = await screen.findAllByRole('checkbox');
+       await waitFor(() => expect(boxes[0]).not.toBeDisabled());
+       for (const box of boxes) fireEvent.click(box);
+-      fireEvent.click(screen.getByRole('button', { name: en.modelLicense.acceptAll.replace('{{count}}', '2') }));
++      fireEvent.click(
++        screen.getByRole('button', { name: en.modelLicense.acceptAll.replace('{{count}}', '2') }),
++      );
+       if (closeWhilePending) {
+         fireEvent.keyDown(screen.getByRole('dialog'), { key: 'Escape', code: 'Escape' });
+         await waitFor(() => expect(screen.queryByRole('dialog')).not.toBeInTheDocument());
+@@ -758,8 +804,11 @@ it.each([['clone', false], ['design', false], ['clone', true], ['design', true]]
+         releaseAcceptance();
+       }
+       await waitFor(() => expect(accepted.size).toBe(2));
+-      await waitFor(() => expect(screen.queryByText(en.modelLicense.requiredError)).not.toBeInTheDocument());
+-      if (!closeWhilePending) fireEvent.click(screen.getByRole('button', { name: en.common.close }));
++      await waitFor(() =>
++        expect(screen.queryByText(en.modelLicense.requiredError)).not.toBeInTheDocument(),
++      );
++      if (!closeWhilePending)
++        fireEvent.click(screen.getByRole('button', { name: en.common.close }));
+       await waitFor(() => expect(screen.queryByRole('dialog')).not.toBeInTheDocument());
+       expect(screen.queryByRole('alert')).not.toBeInTheDocument();
+       expect(generateClone).toHaveBeenCalledOnce();
+@@ -773,54 +822,179 @@ it.each([['clone', false], ['design', false], ['clone', true], ['design', true]]
+ it.each([
+   ['records a warm take', { status: 'ready', loading: false }, 1],
+   ['skips a take that waited for model loading', { status: 'loading', loading: true }, 0],
+-] as const)('measures render speed locally per engine and device (%s)', async (_name, status, count) => {
+-  modelStatus.value = { ...status };
+-  localStorage.removeItem('voicestudio.render-speed.v1');
+-  patchCloneSettings({
+-    text: 'A cloned voice line long enough to measure.',
+-    selectedProfileId: 'speaker-speed',
+-    steps: null,
+-    autoPlay: false,
+-  });
+-  vi.mocked(generateClone)
+-    .mockReset()
+-    .mockImplementation(
+-      () =>
+-        new Promise((resolve) =>
+-          setTimeout(
+-            () =>
+-              resolve({
+-                id: `take-speed-${count}`,
+-                durationSeconds: 3,
+-                genTimeSeconds: 9,
+-              } as Awaited<ReturnType<typeof generateClone>>),
+-            50,
++] as const)(
++  'measures render speed locally per engine and device (%s)',
++  async (_name, status, count) => {
++    modelStatus.value = { ...status };
++    localStorage.removeItem('voicestudio.render-speed.v1');
++    patchCloneSettings({
++      text: 'A cloned voice line long enough to measure.',
++      selectedProfileId: 'speaker-speed',
++      steps: null,
++      autoPlay: false,
++    });
++    vi.mocked(generateClone)
++      .mockReset()
++      .mockImplementation(
++        () =>
++          new Promise((resolve) =>
++            setTimeout(
++              () =>
++                resolve({
++                  id: `take-speed-${count}`,
++                  durationSeconds: 3,
++                  genTimeSeconds: 9,
++                } as Awaited<ReturnType<typeof generateClone>>),
++              50,
++            ),
+           ),
+-        ),
++      );
++    const client = new QueryClient();
++    client.setQueryData(queryKeys.engines, { tts: { active: 'omnivoice', backends: [] } });
++    render(
++      <QueryClientProvider client={client}>
++        <GenerationProvider>
++          <Consumer name={`speed-${count}`} />
++        </GenerationProvider>
++      </QueryClientProvider>,
+     );
+-  const client = new QueryClient();
+-  client.setQueryData(queryKeys.engines, { tts: { active: 'omnivoice', backends: [] } });
+-  render(
+-    <QueryClientProvider client={client}>
+-      <GenerationProvider>
+-        <Consumer name={`speed-${count}`} />
+-      </GenerationProvider>
+-    </QueryClientProvider>,
+-  );
+-  fireEvent.click(screen.getByText(`speed-${count}:idle`));
+-  await waitFor(() => {
+-    const takes = JSON.parse(localStorage.getItem('voicestudio.take-settings.v1') ?? '{}');
+-    // The take keeps the steps it rendered with, not "best for whatever engine is active".
+-    expect(takes[`take-speed-${count}`]?.steps).toBe(32);
++    fireEvent.click(screen.getByText(`speed-${count}:idle`));
++    await waitFor(() => {
++      const takes = JSON.parse(localStorage.getItem('voicestudio.take-settings.v1') ?? '{}');
++      // The take keeps the steps it rendered with, not "best for whatever engine is active".
++      expect(takes[`take-speed-${count}`]?.steps).toBe(32);
++    });
++    expect(vi.mocked(generateClone).mock.calls[0][0].steps).toBe(32);
++    const stored = JSON.parse(localStorage.getItem('voicestudio.render-speed.v1') ?? '{}');
++    expect(stored['omnivoice|cuda'] ?? []).toHaveLength(count);
++    if (count)
++      expect(stored['omnivoice|cuda'][0]).toMatchObject({
++        chars: 43,
++        audioSeconds: 3,
++        renderSeconds: 9,
++        steps: 32,
++      });
++  },
++);
++
++describe('TXT batches inside voice cloning', () => {
++  beforeEach(() => {
++    vi.clearAllMocks();
++    batchNative.enabled = true;
++    batchNative.begin.mockResolvedValue('directory-token');
++    batchNative.end.mockResolvedValue(undefined);
++    batchNative.save.mockResolvedValue({ canceled: false, path: 'saved.wav' });
++    patchCloneSettings({
++      text: 'Edited first line',
++      selectedProfileId: 'voice-1',
++      autoPlay: false,
++      sourceName: 'Bai_01',
++      subtitleLines: true,
++      batchAudioFormat: 'wav',
++      duration: '',
++    });
++    setCloneScripts([
++      { sourceName: 'Bai_01', text: 'Original first line' },
++      { sourceName: 'Bai_02', text: 'Second line' },
++      { sourceName: 'Bai_03', text: 'Third line' },
++    ]);
++    vi.mocked(generateClone).mockResolvedValue({
++      blob: new Blob(),
++      id: '12345678',
++      audioPath: '12345678.wav',
++      subtitlePath: '12345678.srt',
++      durationSeconds: 1,
++      genTimeSeconds: 1,
++      seed: 1,
++      routing: null,
++      dropped: null,
++    });
+   });
+-  expect(vi.mocked(generateClone).mock.calls[0][0].steps).toBe(32);
+-  const stored = JSON.parse(localStorage.getItem('voicestudio.render-speed.v1') ?? '{}');
+-  expect(stored['omnivoice|cuda'] ?? []).toHaveLength(count);
+-  if (count)
+-    expect(stored['omnivoice|cuda'][0]).toMatchObject({
+-      chars: 43,
+-      audioSeconds: 3,
+-      renderSeconds: 9,
+-      steps: 32,
++  const mount = () =>
++    render(
++      <QueryClientProvider client={new QueryClient()}>
++        <GenerationProvider>
++          <Consumer name="batch" />
++        </GenerationProvider>
++      </QueryClientProvider>,
++    );
++  it('renders and saves every TXT sequentially using one chosen directory', async () => {
++    const order: string[] = [];
++    vi.mocked(generateClone).mockImplementation(async (input) => {
++      order.push('render:' + input.text);
++      return {
++        blob: new Blob(),
++        id: '12345678',
++        audioPath: '12345678.wav',
++        subtitlePath: '12345678.srt',
++        durationSeconds: 1,
++        genTimeSeconds: 1,
++        seed: 1,
++        routing: null,
++        dropped: null,
++      };
+     });
++    batchNative.save.mockImplementation(async (req) => {
++      order.push('save:' + req.suggestedName);
++      return { canceled: false, path: req.suggestedName };
++    });
++    mount();
++    fireEvent.click(screen.getByText('batch:idle'));
++    await waitFor(() => expect(batchNative.end).toHaveBeenCalledWith('directory-token'));
++    expect(order).toEqual([
++      'render:Edited first line',
++      'save:Bai_01.wav',
++      'render:Second line',
++      'save:Bai_02.wav',
++      'render:Third line',
++      'save:Bai_03.wav',
++    ]);
++    expect(batchNative.begin).toHaveBeenCalledTimes(1);
++    expect(
++      batchNative.save.mock.calls.every(
++        ([req]) =>
++          req.batchToken === 'directory-token' && req.subtitleUrl === '/api/audio/12345678.srt',
++      ),
++    ).toBe(true);
++    expect(
++      vi
++        .mocked(generateClone)
++        .mock.calls.every(([input]) => input.subtitleLines && input.profileId === 'voice-1'),
++    ).toBe(true);
++    setCloneScripts([]);
++  });
++  it('exports MP3 and SRT with matching TXT basenames', async () => {
++    patchCloneSettings({ batchAudioFormat: 'mp3' });
++    mount();
++    fireEvent.click(screen.getByText('batch:idle'));
++    await waitFor(() => expect(batchNative.end).toHaveBeenCalled());
++    expect(batchNative.save.mock.calls.map(([req]) => req.suggestedName)).toEqual([
++      'Bai_01.mp3',
++      'Bai_02.mp3',
++      'Bai_03.mp3',
++    ]);
++    expect(batchNative.save.mock.calls[0][0].url).toBe('/api/audio/12345678.mp3');
++    setCloneScripts([]);
++  });
++  it('stops the queue on a save failure and releases the directory capability', async () => {
++    batchNative.save
++      .mockResolvedValueOnce({ canceled: false, path: 'Bai_01.wav' })
++      .mockRejectedValueOnce(new Error('disk full'));
++    mount();
++    fireEvent.click(screen.getByText('batch:idle'));
++    await waitFor(() => expect(batchNative.end).toHaveBeenCalled());
++    expect(generateClone).toHaveBeenCalledTimes(2);
++    expect(batchNative.save).toHaveBeenCalledTimes(2);
++    setCloneScripts([]);
++  });
++  it('does not render anything if folder selection is canceled', async () => {
++    batchNative.begin.mockResolvedValueOnce(null);
++    mount();
++    fireEvent.click(screen.getByText('batch:idle'));
++    await waitFor(() => expect(batchNative.begin).toHaveBeenCalled());
++    await waitFor(() => expect(screen.getByText('batch:idle')).toBeInTheDocument());
++    expect(generateClone).not.toHaveBeenCalled();
++    expect(batchNative.save).not.toHaveBeenCalled();
++    setCloneScripts([]);
++  });
+ });
+diff --git a/electron/src/renderer/src/hooks/use-generate.ts b/electron/src/renderer/src/hooks/use-generate.ts
+index a1a9f04..e9ae86c 100644
+--- a/electron/src/renderer/src/hooks/use-generate.ts
++++ b/electron/src/renderer/src/hooks/use-generate.ts
+@@ -42,6 +42,10 @@ import { recordActionBreadcrumb } from '@/lib/report-breadcrumb';
+ import { useResolvedLicenceError } from './use-resolved-licence-error';
+ import { announceDroppedSpeech } from '@/lib/dropped-speech';
+ import { recordTakeSpeed } from '@/lib/store/quality-offer';
++import { cloneScriptsStore } from '@/lib/store/clone-scripts';
++import { getBridge } from '@/components/bridge';
++import { audioUrl, audioMp3Url } from '@/lib/api/client';
++import { saveBackendFile } from '@/lib/native-save';
+ 
+ const TIMER_TICK_MS = 100;
+ const PROGRESS_THROTTLE_MS = 100;
+@@ -89,6 +93,7 @@ export interface UseGenerateClone {
+   generate(): Promise<void>;
+   cancel(): void;
+   isGenerating: boolean;
++  batchProgress?: { index: number; total: number; sourceName: string } | null;
+   elapsedSeconds: number;
+   /** 0..100 while the WAV body streams in; null when unknown. */
+   progress: number | null;
+@@ -200,6 +205,7 @@ function useGenerateController(): UseGenerateClone {
+   }, []);
+   useResolvedLicenceError(errorCause, clearError);
+   const [isGenerating, setIsGenerating] = useState(false);
++  const [batchProgress, setBatchProgress] = useState<UseGenerateClone['batchProgress']>(null);
+   const [elapsedSeconds, setElapsedSeconds] = useState(0);
+   const [progress, setProgress] = useState<number | null>(null);
+   const [stage, setStage] = useState<UseGenerateClone['stage']>('preparing');
+@@ -350,124 +356,169 @@ function useGenerateController(): UseGenerateClone {
+       }, TIMER_TICK_MS);
+       const controller = new AbortController();
+       abortRef.current = controller;
++      const queued = !design ? [...cloneScriptsStore.state] : [];
++      const jobs =
++        queued.length > 1
++          ? queued.map((item, index) => (index === 0 ? { ...item, text: settings.text } : item))
++          : [{ text: design?.text ?? settings.text, sourceName: settings.sourceName }];
++      const initialSettings = settings;
++      const bridge = getBridge();
++      let batchToken: string | null = null;
+       try {
+-        // A preset-only engine that can't design never reads a style
+-        // instruct, and /generate refuses one there as a design request: the
+-        // preset voice take keeps working with a leftover instruct (#3413).
+-        const style =
+-          design?.instruct ??
+-          (presetOnly && activeTts?.supports_voice_design === false ? '' : settings.instruct);
+-        // Delivery direction is a per-engine draft like IndexTTS2 emotion: only
+-        // engines whose instruct steers a clone receive it; others never see it.
+-        const direction = !design && sendsDirection ? settings.direction.trim() : '';
+-        const free = [style.trim(), direction].filter(Boolean).join(', ');
+-        // Only tag-list engines need the text filtered (with warnings); a
+-        // free-form engine reads whatever was written.
+-        const wording = free.trim();
+-        let instruct = wording;
+-        if (wording && instructVocabulary !== 'freeform') instruct = announceInstructWarnings(free);
+-        const input = {
+-          text: design?.text ?? settings.text,
+-          seed: design?.seed,
+-          language: design?.language ?? settings.language,
+-          // A preset-only engine renders its preset voice; sending the saved
+-          // voice or clip would be refused (it cannot clone).
+-          profileId: design
+-            ? (design.profileId ?? null)
+-            : presetOnly
+-              ? null
+-              : settings.selectedProfileId,
+-          refAudio: design || settings.selectedProfileId || presetOnly ? null : reference.file,
+-          refText:
+-            design || presetOnly
+-              ? undefined
+-              : settings.selectedProfileId
+-                ? manualProfileTranscript(
+-                    settings.refText,
+-                    queryClient
+-                      .getQueryData<Profile[]>(queryKeys.profiles)
+-                      ?.find((profile) => profile.id === settings.selectedProfileId)?.ref_text,
+-                  )
+-                : settings.refText,
+-          instruct,
+-          instructVocabulary,
+-          designRecipe: design?.recipe,
+-          // IndexTTS2's emotion controls affect the performance, not the
+-          // reference voice. Never leak stale emotion options to other engines
+-          // or to the separate Voice Design workspace.
+-          ...(!design && activeTts?.supports_emotion
+-            ? settings.emotionMode === 'vector'
+-              ? { emoVector: [...settings.emotionVector] }
+-              : settings.emotionMode === 'text' && settings.emotionText.trim()
+-                ? { emoText: settings.emotionText.trim(), emoAlpha: settings.emotionAlpha }
+-                : {}
+-            : {}),
+-          steps: effectiveSamplingSteps(
+-            settings.steps,
+-            queryClient.getQueryData<EnginesResponse>(queryKeys.engines)?.tts?.active,
+-          ),
+-          wavBits: settings.wavBits,
+-          effectPreset: settings.effectPreset,
+-          presetVoice: activeTts?.preset_voices?.includes(settings.presetVoice)
+-            ? settings.presetVoice
+-            : undefined,
+-          cfg: settings.cfg,
+-          speed: settings.speed,
+-          tShift: settings.tShift,
+-          posTemp: settings.posTemp,
+-          classTemp: settings.classTemp,
+-          layerPenalty: settings.layerPenalty,
+-          denoise: settings.denoise,
+-          postprocess: settings.postprocess,
+-          duration: settings.duration,
+-        };
+-        const result = await generateClone(input, {
+-          signal: controller.signal,
+-          onProgress,
+-        });
+-        announceResultNotices(result);
+-        const spokenText = (design?.text ?? settings.text).trim();
+-        if (
+-          activeTts &&
+-          !sawModelLoadRef.current &&
+-          result.genTimeSeconds !== null &&
+-          result.durationSeconds !== null
+-        )
+-          // Local only: per engine and device, so the next estimate is this machine's.
+-          recordTakeSpeed(activeTts.id, activeTts.effective_device, {
+-            chars: spokenText.length,
+-            audioSeconds: result.durationSeconds,
+-            renderSeconds: result.genTimeSeconds,
+-            steps: input.steps,
+-            at: Date.now(),
+-          });
+-        setLatestOutput(result, design?.text ?? settings.text);
+-        recordActionBreadcrumb(`generate:${reportMode}:complete`);
+-        toast.success(tr('tts.generationComplete'), { position: 'top-right' });
+-        if (!design)
+-          // Record what was actually rendered: a take sent without emotion (an
+-          // engine without IndexTTS2 controls, or Off) or without a delivery
+-          // direction is saved without it, so reusing it later never adds
+-          // direction the recording did not use.
+-          rememberTake(result.id, {
+-            ...settings,
+-            // The steps actually rendered, not "best quality" for whichever engine is active later.
+-            steps: input.steps,
+-            direction,
+-            ...('emoText' in input || 'emoVector' in input
+-              ? {}
+-              : {
+-                  emotionMode: DEFAULT_CLONE_SETTINGS.emotionMode,
+-                  emotionText: DEFAULT_CLONE_SETTINGS.emotionText,
+-                  emotionAlpha: DEFAULT_CLONE_SETTINGS.emotionAlpha,
+-                  emotionVector: [...DEFAULT_CLONE_SETTINGS.emotionVector],
+-                }),
++        if (jobs.length > 1) {
++          if (!bridge?.files.beginBatchExport) throw new Error(tr('clone.batch_desktop'));
++          batchToken = await bridge.files.beginBatchExport();
++          if (!batchToken || controller.signal.aborted) return;
++        }
++        for (const [index, job] of jobs.entries()) {
++          if (controller.signal.aborted) break;
++          setProgress(null);
++          setStage('generating');
++          setBatchProgress(
++            jobs.length > 1
++              ? { index: index + 1, total: jobs.length, sourceName: job.sourceName }
++              : null,
++          );
++          const settings = {
++            ...initialSettings,
++            ...job,
++            subtitleLines: initialSettings.subtitleLines || jobs.length > 1,
++          };
++          // A preset-only engine that can't design never reads a style
++          // instruct, and /generate refuses one there as a design request: the
++          // preset voice take keeps working with a leftover instruct (#3413).
++          const style =
++            design?.instruct ??
++            (presetOnly && activeTts?.supports_voice_design === false ? '' : settings.instruct);
++          // Delivery direction is a per-engine draft like IndexTTS2 emotion: only
++          // engines whose instruct steers a clone receive it; others never see it.
++          const direction = !design && sendsDirection ? settings.direction.trim() : '';
++          const free = [style.trim(), direction].filter(Boolean).join(', ');
++          // Only tag-list engines need the text filtered (with warnings); a
++          // free-form engine reads whatever was written.
++          const wording = free.trim();
++          let instruct = wording;
++          if (wording && instructVocabulary !== 'freeform')
++            instruct = announceInstructWarnings(free);
++          const input = {
++            text: design?.text ?? settings.text,
++            subtitleLines: !design && settings.subtitleLines,
++            seed: design?.seed,
++            language: design?.language ?? settings.language,
++            // A preset-only engine renders its preset voice; sending the saved
++            // voice or clip would be refused (it cannot clone).
++            profileId: design
++              ? (design.profileId ?? null)
++              : presetOnly
++                ? null
++                : settings.selectedProfileId,
++            refAudio: design || settings.selectedProfileId || presetOnly ? null : reference.file,
++            refText:
++              design || presetOnly
++                ? undefined
++                : settings.selectedProfileId
++                  ? manualProfileTranscript(
++                      settings.refText,
++                      queryClient
++                        .getQueryData<Profile[]>(queryKeys.profiles)
++                        ?.find((profile) => profile.id === settings.selectedProfileId)?.ref_text,
++                    )
++                  : settings.refText,
++            instruct,
++            instructVocabulary,
++            designRecipe: design?.recipe,
++            // IndexTTS2's emotion controls affect the performance, not the
++            // reference voice. Never leak stale emotion options to other engines
++            // or to the separate Voice Design workspace.
++            ...(!design && activeTts?.supports_emotion
++              ? settings.emotionMode === 'vector'
++                ? { emoVector: [...settings.emotionVector] }
++                : settings.emotionMode === 'text' && settings.emotionText.trim()
++                  ? { emoText: settings.emotionText.trim(), emoAlpha: settings.emotionAlpha }
++                  : {}
++              : {}),
++            steps: effectiveSamplingSteps(
++              settings.steps,
++              queryClient.getQueryData<EnginesResponse>(queryKeys.engines)?.tts?.active,
++            ),
++            wavBits: settings.wavBits,
++            effectPreset: settings.effectPreset,
++            presetVoice: activeTts?.preset_voices?.includes(settings.presetVoice)
++              ? settings.presetVoice
++              : undefined,
++            cfg: settings.cfg,
++            speed: settings.speed,
++            tShift: settings.tShift,
++            posTemp: settings.posTemp,
++            classTemp: settings.classTemp,
++            layerPenalty: settings.layerPenalty,
++            denoise: settings.denoise,
++            postprocess: settings.postprocess,
++            duration: settings.subtitleLines ? '' : settings.duration,
++          };
++          const result = await generateClone(input, {
++            signal: controller.signal,
++            onProgress,
+           });
+-        void Promise.all([
+-          queryClient.invalidateQueries({ queryKey: queryKeys.history }),
+-          queryClient.invalidateQueries({ queryKey: ['loaded-models'] }),
+-          queryClient.invalidateQueries({ queryKey: queryKeys.engines }),
+-        ]).catch(() => {});
++          if (!design && settings.sourceName) result.sourceName = settings.sourceName;
++          announceResultNotices(result);
++          const spokenText = (design?.text ?? settings.text).trim();
++          if (
++            activeTts &&
++            !sawModelLoadRef.current &&
++            result.genTimeSeconds !== null &&
++            result.durationSeconds !== null
++          )
++            // Local only: per engine and device, so the next estimate is this machine's.
++            recordTakeSpeed(activeTts.id, activeTts.effective_device, {
++              chars: spokenText.length,
++              audioSeconds: result.durationSeconds,
++              renderSeconds: result.genTimeSeconds,
++              steps: input.steps,
++              at: Date.now(),
++            });
++          if (batchToken) {
++            if (!result.audioPath || !result.subtitlePath) throw new Error(tr('clone.batch_error'));
++            const format = initialSettings.batchAudioFormat;
++            const url =
++              format === 'mp3' ? audioMp3Url(result.audioPath) : audioUrl(result.audioPath);
++            if (!url) throw new Error(tr('clone.batch_error'));
++            const saved = await saveBackendFile({
++              url,
++              subtitleUrl: audioUrl(result.subtitlePath),
++              suggestedName: `${job.sourceName}.${format}`,
++              batchToken,
++            });
++            if (!saved || saved.canceled) throw new Error(tr('clone.batch_error'));
++          }
++          setLatestOutput(result, design?.text ?? settings.text);
++          recordActionBreadcrumb(`generate:${reportMode}:complete`);
++          toast.success(tr('tts.generationComplete'), { position: 'top-right' });
++          if (!design)
++            // Record what was actually rendered: a take sent without emotion (an
++            // engine without IndexTTS2 controls, or Off) or without a delivery
++            // direction is saved without it, so reusing it later never adds
++            // direction the recording did not use.
++            rememberTake(result.id, {
++              ...settings,
++              // The steps actually rendered, not "best quality" for whichever engine is active later.
++              steps: input.steps,
++              direction,
++              ...('emoText' in input || 'emoVector' in input
++                ? {}
++                : {
++                    emotionMode: DEFAULT_CLONE_SETTINGS.emotionMode,
++                    emotionText: DEFAULT_CLONE_SETTINGS.emotionText,
++                    emotionAlpha: DEFAULT_CLONE_SETTINGS.emotionAlpha,
++                    emotionVector: [...DEFAULT_CLONE_SETTINGS.emotionVector],
++                  }),
++            });
++          void Promise.all([
++            queryClient.invalidateQueries({ queryKey: queryKeys.history }),
++            queryClient.invalidateQueries({ queryKey: ['loaded-models'] }),
++            queryClient.invalidateQueries({ queryKey: queryKeys.engines }),
++          ]).catch(() => {});
++        }
+       } catch (err) {
+         if (!cancelledRef.current) {
+           recordActionBreadcrumb(`generate:${reportMode}:error`);
+@@ -482,6 +533,7 @@ function useGenerateController(): UseGenerateClone {
+           );
+         }
+       } finally {
++        if (batchToken) await bridge?.files.endBatchExport(batchToken).catch(() => {});
+         finishActivity();
+         release();
+         activeRef.current = false;
+@@ -490,6 +542,7 @@ function useGenerateController(): UseGenerateClone {
+         if (timerRef.current) clearInterval(timerRef.current);
+         timerRef.current = null;
+         setIsGenerating(false);
++        setBatchProgress(null);
+         setProgress(null);
+         setModelStage(null);
+         setModelProgress(null);
+@@ -525,6 +578,7 @@ function useGenerateController(): UseGenerateClone {
+     generateDesign: generate,
+     cancel,
+     isGenerating,
++    batchProgress,
+     elapsedSeconds,
+     progress,
+     stage,
+diff --git a/electron/src/renderer/src/i18n/locales/ar.json b/electron/src/renderer/src/i18n/locales/ar.json
+index a262f27..07bddb2 100644
+--- a/electron/src/renderer/src/i18n/locales/ar.json
++++ b/electron/src/renderer/src/i18n/locales/ar.json
+@@ -573,6 +573,12 @@
+     "working": "جارٍ العمل…"
+   },
+   "clone": {
++    "line_subtitles": "حفظ الصوت وSRT (ترجمة واحدة لكل سطر من النص)",
++    "download_pair": "حفظ الصوت وSRT",
++    "batch_scripts": "{{count}} ملفات TXT · تُعالج بالترتيب أدناه",
++    "batch_clear": "الاحتفاظ بالملف الأول فقط",
++    "batch_desktop": "يتطلب التصدير الدفعي تطبيق سطح المكتب.",
++    "batch_error": "تعذر حفظ الدفعة. تحقق من مجلد الإخراج والصوت وSRT.",
+     "text_label": "النص",
+     "paste": "لصق",
+     "paste_failed": "تم حظر الوصول إلى الحافظة. الصق مباشرة في حقل النص باستخدام لوحة المفاتيح.",
+diff --git a/electron/src/renderer/src/i18n/locales/de.json b/electron/src/renderer/src/i18n/locales/de.json
+index fa7ec48..0759659 100644
+--- a/electron/src/renderer/src/i18n/locales/de.json
++++ b/electron/src/renderer/src/i18n/locales/de.json
+@@ -553,6 +553,12 @@
+     "working": "Wird verarbeitet…"
+   },
+   "clone": {
++    "line_subtitles": "Audio + SRT speichern (ein Untertitel pro Textzeile)",
++    "download_pair": "Audio + SRT speichern",
++    "batch_scripts": "{{count}} TXT-Dateien · Verarbeitung in dieser Reihenfolge",
++    "batch_clear": "Nur die erste Datei behalten",
++    "batch_desktop": "Der Stapelexport benötigt die Desktop-App.",
++    "batch_error": "Der Stapel konnte nicht gespeichert werden. Prüfen Sie den Ausgabeordner und Audio/SRT.",
+     "text_label": "Text",
+     "paste": "Einfügen",
+     "paste_failed": "Der Zugriff auf die Zwischenablage wurde blockiert. Füge den Inhalt mit der Tastatur direkt ins Textfeld ein.",
+diff --git a/electron/src/renderer/src/i18n/locales/en.json b/electron/src/renderer/src/i18n/locales/en.json
+index 3bff2b4..90a249c 100644
+--- a/electron/src/renderer/src/i18n/locales/en.json
++++ b/electron/src/renderer/src/i18n/locales/en.json
+@@ -475,6 +475,12 @@
+     "selfTestUnreachable": "Couldn't run the self-test. Check that VoiceStudio is still running, then try again."
+   },
+   "clone": {
++    "line_subtitles": "Save audio + SRT (one subtitle per script line)",
++    "download_pair": "Save audio + SRT",
++    "batch_scripts": "{{count}} TXT files · processed in the order below",
++    "batch_clear": "Keep only the first file",
++    "batch_desktop": "Batch export requires the desktop app.",
++    "batch_error": "The batch could not be saved. Check the output folder and audio/SRT availability.",
+     "title": "Voice cloning",
+     "text_label": "Script",
+     "paste": "Paste",
+diff --git a/electron/src/renderer/src/i18n/locales/es.json b/electron/src/renderer/src/i18n/locales/es.json
+index d9fe624..9ead297 100644
+--- a/electron/src/renderer/src/i18n/locales/es.json
++++ b/electron/src/renderer/src/i18n/locales/es.json
+@@ -555,6 +555,12 @@
+     "working": "Procesando…"
+   },
+   "clone": {
++    "line_subtitles": "Guardar audio + SRT (un subtítulo por línea del guion)",
++    "download_pair": "Guardar audio + SRT",
++    "batch_scripts": "{{count}} archivos TXT · procesados en el orden indicado",
++    "batch_clear": "Conservar solo el primer archivo",
++    "batch_desktop": "La exportación por lotes requiere la aplicación de escritorio.",
++    "batch_error": "No se pudo guardar el lote. Comprueba la carpeta de destino y el audio/SRT.",
+     "text_label": "Texto",
+     "paste": "Pegar",
+     "paste_failed": "Se bloqueó el acceso al portapapeles. Pega directamente en el campo de texto con el teclado.",
+diff --git a/electron/src/renderer/src/i18n/locales/fr.json b/electron/src/renderer/src/i18n/locales/fr.json
+index 58671a8..a859c83 100644
+--- a/electron/src/renderer/src/i18n/locales/fr.json
++++ b/electron/src/renderer/src/i18n/locales/fr.json
+@@ -555,6 +555,12 @@
+     "working": "Traitement en cours…"
+   },
+   "clone": {
++    "line_subtitles": "Enregistrer audio + SRT (un sous-titre par ligne du texte)",
++    "download_pair": "Enregistrer audio + SRT",
++    "batch_scripts": "{{count}} fichiers TXT · traités dans cet ordre",
++    "batch_clear": "Garder uniquement le premier fichier",
++    "batch_desktop": "L’export par lots nécessite l’application de bureau.",
++    "batch_error": "Impossible d’enregistrer le lot. Vérifiez le dossier de sortie et l’audio/SRT.",
+     "text_label": "Texte",
+     "paste": "Coller",
+     "paste_failed": "L’accès au presse-papiers est bloqué. Collez directement dans le champ de texte avec le clavier.",
+diff --git a/electron/src/renderer/src/i18n/locales/gl.json b/electron/src/renderer/src/i18n/locales/gl.json
+index 1584ca4..66eee0c 100644
+--- a/electron/src/renderer/src/i18n/locales/gl.json
++++ b/electron/src/renderer/src/i18n/locales/gl.json
+@@ -475,6 +475,12 @@
+     "selfTestUnreachable": "Non se puido executar a autoproba. Comproba que VoiceStudio segue en marcha e téntao de novo."
+   },
+   "clone": {
++    "line_subtitles": "Gardar audio + SRT (un subtítulo por liña do guión)",
++    "download_pair": "Gardar audio + SRT",
++    "batch_scripts": "{{count}} ficheiros TXT · procesados nesta orde",
++    "batch_clear": "Conservar só o primeiro ficheiro",
++    "batch_desktop": "A exportación por lotes require a aplicación de escritorio.",
++    "batch_error": "Non se puido gardar o lote. Comproba o cartafol de saída e o audio/SRT.",
+     "title": "Clonación de voz",
+     "text_label": "Guión",
+     "paste": "Pegar",
+diff --git a/electron/src/renderer/src/i18n/locales/hi.json b/electron/src/renderer/src/i18n/locales/hi.json
+index 9e76498..1428806 100644
+--- a/electron/src/renderer/src/i18n/locales/hi.json
++++ b/electron/src/renderer/src/i18n/locales/hi.json
+@@ -553,6 +553,12 @@
+     "working": "कार्य जारी है…"
+   },
+   "clone": {
++    "line_subtitles": "ऑडियो + SRT सहेजें (स्क्रिप्ट की हर पंक्ति के लिए एक उपशीर्षक)",
++    "download_pair": "ऑडियो + SRT सहेजें",
++    "batch_scripts": "{{count}} TXT फ़ाइलें · नीचे दिए क्रम में संसाधित होंगी",
++    "batch_clear": "केवल पहली फ़ाइल रखें",
++    "batch_desktop": "बैच निर्यात के लिए डेस्कटॉप ऐप आवश्यक है।",
++    "batch_error": "बैच सहेजा नहीं जा सका। आउटपुट फ़ोल्डर और ऑडियो/SRT की जाँच करें।",
+     "text_label": "पाठ",
+     "paste": "चिपकाएँ",
+     "paste_failed": "क्लिपबोर्ड का उपयोग अवरुद्ध है। कीबोर्ड से सीधे पाठ फ़ील्ड में चिपकाएँ।",
+diff --git a/electron/src/renderer/src/i18n/locales/id.json b/electron/src/renderer/src/i18n/locales/id.json
+index 3177154..c458141 100644
+--- a/electron/src/renderer/src/i18n/locales/id.json
++++ b/electron/src/renderer/src/i18n/locales/id.json
+@@ -553,6 +553,12 @@
+     "working": "Memproses…"
+   },
+   "clone": {
++    "line_subtitles": "Simpan audio + SRT (satu takarir per baris naskah)",
++    "download_pair": "Simpan audio + SRT",
++    "batch_scripts": "{{count}} berkas TXT · diproses sesuai urutan berikut",
++    "batch_clear": "Simpan hanya berkas pertama",
++    "batch_desktop": "Ekspor massal memerlukan aplikasi desktop.",
++    "batch_error": "Kumpulan tidak dapat disimpan. Periksa folder keluaran dan audio/SRT.",
+     "text_label": "Teks",
+     "paste": "Tempel",
+     "paste_failed": "Akses papan klip diblokir. Tempel langsung ke kolom teks menggunakan papan ketik.",
+diff --git a/electron/src/renderer/src/i18n/locales/it.json b/electron/src/renderer/src/i18n/locales/it.json
+index e3392fe..887c070 100644
+--- a/electron/src/renderer/src/i18n/locales/it.json
++++ b/electron/src/renderer/src/i18n/locales/it.json
+@@ -555,6 +555,12 @@
+     "working": "Elaborazione…"
+   },
+   "clone": {
++    "line_subtitles": "Salva audio + SRT (un sottotitolo per riga del testo)",
++    "download_pair": "Salva audio + SRT",
++    "batch_scripts": "{{count}} file TXT · elaborati in questo ordine",
++    "batch_clear": "Mantieni solo il primo file",
++    "batch_desktop": "L’esportazione in blocco richiede l’app desktop.",
++    "batch_error": "Impossibile salvare il gruppo. Controlla la cartella di destinazione e audio/SRT.",
+     "text_label": "Testo",
+     "paste": "Incolla",
+     "paste_failed": "L’accesso agli appunti è bloccato. Incolla direttamente nel campo di testo con la tastiera.",
+diff --git a/electron/src/renderer/src/i18n/locales/ja.json b/electron/src/renderer/src/i18n/locales/ja.json
+index a1f574a..60229fd 100644
+--- a/electron/src/renderer/src/i18n/locales/ja.json
++++ b/electron/src/renderer/src/i18n/locales/ja.json
+@@ -553,6 +553,12 @@
+     "working": "処理中…"
+   },
+   "clone": {
++    "line_subtitles": "音声とSRTを保存（原稿の各行を字幕にする）",
++    "download_pair": "音声とSRTを保存",
++    "batch_scripts": "TXT {{count}}件・以下の順序で処理",
++    "batch_clear": "最初のファイルのみ残す",
++    "batch_desktop": "一括書き出しにはデスクトップアプリが必要です。",
++    "batch_error": "一括保存できませんでした。保存先と音声・SRTを確認してください。",
+     "text_label": "テキスト",
+     "paste": "貼り付け",
+     "paste_failed": "クリップボードへのアクセスが拒否されました。キーボードでテキスト欄に直接貼り付けてください。",
+diff --git a/electron/src/renderer/src/i18n/locales/ko.json b/electron/src/renderer/src/i18n/locales/ko.json
+index 1354233..259fe41 100644
+--- a/electron/src/renderer/src/i18n/locales/ko.json
++++ b/electron/src/renderer/src/i18n/locales/ko.json
+@@ -553,6 +553,12 @@
+     "working": "처리 중…"
+   },
+   "clone": {
++    "line_subtitles": "오디오와 SRT 저장 (대본 한 줄당 자막 하나)",
++    "download_pair": "오디오와 SRT 저장",
++    "batch_scripts": "TXT {{count}}개 · 아래 순서로 처리",
++    "batch_clear": "첫 파일만 유지",
++    "batch_desktop": "일괄 내보내기에는 데스크톱 앱이 필요합니다.",
++    "batch_error": "일괄 저장하지 못했습니다. 출력 폴더와 오디오/SRT를 확인하세요.",
+     "text_label": "텍스트",
+     "paste": "붙여넣기",
+     "paste_failed": "클립보드 접근이 차단되었습니다. 키보드로 텍스트 입력란에 직접 붙여넣으세요.",
+diff --git a/electron/src/renderer/src/i18n/locales/nl.json b/electron/src/renderer/src/i18n/locales/nl.json
+index 7e5b393..fe29799 100644
+--- a/electron/src/renderer/src/i18n/locales/nl.json
++++ b/electron/src/renderer/src/i18n/locales/nl.json
+@@ -553,6 +553,12 @@
+     "working": "Verwerken…"
+   },
+   "clone": {
++    "line_subtitles": "Audio + SRT opslaan (één ondertitel per tekstregel)",
++    "download_pair": "Audio + SRT opslaan",
++    "batch_scripts": "{{count}} TXT-bestanden · verwerkt in deze volgorde",
++    "batch_clear": "Alleen het eerste bestand behouden",
++    "batch_desktop": "Batch-export vereist de desktopapp.",
++    "batch_error": "De batch kon niet worden opgeslagen. Controleer de uitvoermap en audio/SRT.",
+     "text_label": "Tekst",
+     "paste": "Plakken",
+     "paste_failed": "Toegang tot het klembord is geblokkeerd. Plak rechtstreeks in het tekstveld met het toetsenbord.",
+diff --git a/electron/src/renderer/src/i18n/locales/pl.json b/electron/src/renderer/src/i18n/locales/pl.json
+index 740d4fa..a319ac4 100644
+--- a/electron/src/renderer/src/i18n/locales/pl.json
++++ b/electron/src/renderer/src/i18n/locales/pl.json
+@@ -563,6 +563,12 @@
+     "working": "Przetwarzanie…"
+   },
+   "clone": {
++    "line_subtitles": "Zapisz dźwięk + SRT (jeden napis na wiersz tekstu)",
++    "download_pair": "Zapisz dźwięk + SRT",
++    "batch_scripts": "Pliki TXT: {{count}} · przetwarzane w podanej kolejności",
++    "batch_clear": "Zachowaj tylko pierwszy plik",
++    "batch_desktop": "Eksport wsadowy wymaga aplikacji komputerowej.",
++    "batch_error": "Nie udało się zapisać partii. Sprawdź folder wyjściowy i dźwięk/SRT.",
+     "text_label": "Tekst",
+     "paste": "Wklej",
+     "paste_failed": "Dostęp do schowka został zablokowany. Wklej bezpośrednio do pola tekstowego za pomocą klawiatury.",
+diff --git a/electron/src/renderer/src/i18n/locales/pt.json b/electron/src/renderer/src/i18n/locales/pt.json
+index 41544d5..28682ae 100644
+--- a/electron/src/renderer/src/i18n/locales/pt.json
++++ b/electron/src/renderer/src/i18n/locales/pt.json
+@@ -555,6 +555,12 @@
+     "working": "Processando…"
+   },
+   "clone": {
++    "line_subtitles": "Salvar áudio + SRT (uma legenda por linha do roteiro)",
++    "download_pair": "Salvar áudio + SRT",
++    "batch_scripts": "{{count}} arquivos TXT · processados nesta ordem",
++    "batch_clear": "Manter apenas o primeiro arquivo",
++    "batch_desktop": "A exportação em lote requer o aplicativo de desktop.",
++    "batch_error": "Não foi possível salvar o lote. Verifique a pasta de saída e o áudio/SRT.",
+     "text_label": "Texto",
+     "paste": "Colar",
+     "paste_failed": "O acesso à área de transferência foi bloqueado. Cole diretamente no campo de texto usando o teclado.",
+diff --git a/electron/src/renderer/src/i18n/locales/ru.json b/electron/src/renderer/src/i18n/locales/ru.json
+index 91e78c7..694a9a1 100644
+--- a/electron/src/renderer/src/i18n/locales/ru.json
++++ b/electron/src/renderer/src/i18n/locales/ru.json
+@@ -563,6 +563,12 @@
+     "working": "Обработка…"
+   },
+   "clone": {
++    "line_subtitles": "Сохранить аудио + SRT (один субтитр на строку текста)",
++    "download_pair": "Сохранить аудио + SRT",
++    "batch_scripts": "TXT-файлов: {{count}} · обработка в указанном порядке",
++    "batch_clear": "Оставить только первый файл",
++    "batch_desktop": "Для пакетного экспорта нужно настольное приложение.",
++    "batch_error": "Не удалось сохранить пакет. Проверьте папку вывода и аудио/SRT.",
+     "text_label": "Текст",
+     "paste": "Вставить",
+     "paste_failed": "Доступ к буферу обмена заблокирован. Вставьте текст прямо в поле с помощью клавиатуры.",
+diff --git a/electron/src/renderer/src/i18n/locales/sv.json b/electron/src/renderer/src/i18n/locales/sv.json
+index 87ca95d..7d3a78b 100644
+--- a/electron/src/renderer/src/i18n/locales/sv.json
++++ b/electron/src/renderer/src/i18n/locales/sv.json
+@@ -553,6 +553,12 @@
+     "working": "Bearbetar…"
+   },
+   "clone": {
++    "line_subtitles": "Spara ljud + SRT (en undertext per textrad)",
++    "download_pair": "Spara ljud + SRT",
++    "batch_scripts": "{{count}} TXT-filer · bearbetas i ordningen nedan",
++    "batch_clear": "Behåll endast den första filen",
++    "batch_desktop": "Batchexport kräver skrivbordsappen.",
++    "batch_error": "Det gick inte att spara satsen. Kontrollera utdatamappen och ljud/SRT.",
+     "text_label": "Text",
+     "paste": "Klistra in",
+     "paste_failed": "Åtkomst till urklipp blockerades. Klistra in direkt i textfältet med tangentbordet.",
+diff --git a/electron/src/renderer/src/i18n/locales/th.json b/electron/src/renderer/src/i18n/locales/th.json
+index af3dd30..802b207 100644
+--- a/electron/src/renderer/src/i18n/locales/th.json
++++ b/electron/src/renderer/src/i18n/locales/th.json
+@@ -553,6 +553,12 @@
+     "working": "กำลังทำงาน…"
+   },
+   "clone": {
++    "line_subtitles": "บันทึกเสียง + SRT (หนึ่งคำบรรยายต่อหนึ่งบรรทัดของบท)",
++    "download_pair": "บันทึกเสียง + SRT",
++    "batch_scripts": "ไฟล์ TXT {{count}} ไฟล์ · ประมวลผลตามลำดับด้านล่าง",
++    "batch_clear": "เก็บเฉพาะไฟล์แรก",
++    "batch_desktop": "การส่งออกเป็นชุดต้องใช้แอปเดสก์ท็อป",
++    "batch_error": "บันทึกชุดไม่ได้ โปรดตรวจสอบโฟลเดอร์ปลายทางและเสียง/SRT",
+     "text_label": "ข้อความ",
+     "paste": "วาง",
+     "paste_failed": "การเข้าถึงคลิปบอร์ดถูกบล็อก โปรดใช้แป้นพิมพ์วางลงในช่องข้อความโดยตรง",
+diff --git a/electron/src/renderer/src/i18n/locales/tr.json b/electron/src/renderer/src/i18n/locales/tr.json
+index 4822ea4..12ceb90 100644
+--- a/electron/src/renderer/src/i18n/locales/tr.json
++++ b/electron/src/renderer/src/i18n/locales/tr.json
+@@ -553,6 +553,12 @@
+     "working": "İşleniyor…"
+   },
+   "clone": {
++    "line_subtitles": "Ses + SRT kaydet (her metin satırı için bir altyazı)",
++    "download_pair": "Ses + SRT kaydet",
++    "batch_scripts": "{{count}} TXT dosyası · aşağıdaki sırayla işlenir",
++    "batch_clear": "Yalnızca ilk dosyayı tut",
++    "batch_desktop": "Toplu dışa aktarma için masaüstü uygulaması gerekir.",
++    "batch_error": "Toplu kayıt başarısız. Çıktı klasörünü ve ses/SRT dosyalarını kontrol edin.",
+     "text_label": "Metin",
+     "paste": "Yapıştır",
+     "paste_failed": "Pano erişimi engellendi. Klavyeyi kullanarak doğrudan metin alanına yapıştırın.",
+diff --git a/electron/src/renderer/src/i18n/locales/uk.json b/electron/src/renderer/src/i18n/locales/uk.json
+index f43879d..5b4373c 100644
+--- a/electron/src/renderer/src/i18n/locales/uk.json
++++ b/electron/src/renderer/src/i18n/locales/uk.json
+@@ -563,6 +563,12 @@
+     "working": "Обробка…"
+   },
+   "clone": {
++    "line_subtitles": "Зберегти аудіо + SRT (один субтитр на рядок тексту)",
++    "download_pair": "Зберегти аудіо + SRT",
++    "batch_scripts": "TXT-файлів: {{count}} · обробка у вказаному порядку",
++    "batch_clear": "Залишити лише перший файл",
++    "batch_desktop": "Для пакетного експорту потрібен настільний застосунок.",
++    "batch_error": "Не вдалося зберегти пакет. Перевірте вихідну папку й аудіо/SRT.",
+     "text_label": "Текст",
+     "paste": "Вставити",
+     "paste_failed": "Доступ до буфера обміну заблоковано. Вставте текст безпосередньо в поле за допомогою клавіатури.",
+diff --git a/electron/src/renderer/src/i18n/locales/vi.json b/electron/src/renderer/src/i18n/locales/vi.json
+index 84feeaa..8f86488 100644
+--- a/electron/src/renderer/src/i18n/locales/vi.json
++++ b/electron/src/renderer/src/i18n/locales/vi.json
+@@ -553,6 +553,12 @@
+     "working": "Đang xử lý…"
+   },
+   "clone": {
++    "line_subtitles": "Lưu âm thanh + SRT (mỗi dòng văn bản là một mục phụ đề)",
++    "download_pair": "Lưu âm thanh + SRT",
++    "batch_scripts": "{{count}} tệp TXT · xử lý theo thứ tự bên dưới",
++    "batch_clear": "Chỉ giữ tệp đầu tiên",
++    "batch_desktop": "Xuất hàng loạt cần ứng dụng máy tính.",
++    "batch_error": "Không lưu được hàng loạt. Kiểm tra thư mục lưu và âm thanh/SRT.",
+     "text_label": "Văn bản",
+     "paste": "Dán",
+     "paste_failed": "Quyền truy cập bảng nhớ tạm đã bị chặn. Hãy dùng bàn phím để dán trực tiếp vào ô văn bản.",
+diff --git a/electron/src/renderer/src/i18n/locales/zh-CN.json b/electron/src/renderer/src/i18n/locales/zh-CN.json
+index 91c77fc..ce5809b 100644
+--- a/electron/src/renderer/src/i18n/locales/zh-CN.json
++++ b/electron/src/renderer/src/i18n/locales/zh-CN.json
+@@ -568,6 +568,12 @@
+     "working": "处理中…"
+   },
+   "clone": {
++    "line_subtitles": "保存音频和 SRT（每行文本对应一条字幕）",
++    "download_pair": "保存音频和 SRT",
++    "batch_scripts": "{{count}} 个 TXT 文件 · 按以下顺序处理",
++    "batch_clear": "仅保留第一个文件",
++    "batch_desktop": "批量导出需要桌面应用。",
++    "batch_error": "无法保存批次。请检查输出文件夹和音频/SRT。",
+     "text_label": "文本",
+     "paste": "粘贴",
+     "paste_failed": "剪贴板访问被阻止。请使用键盘直接粘贴到文本框中。",
+diff --git a/electron/src/renderer/src/i18n/locales/zh-TW.json b/electron/src/renderer/src/i18n/locales/zh-TW.json
+index 5dad25f..3dfa99d 100644
+--- a/electron/src/renderer/src/i18n/locales/zh-TW.json
++++ b/electron/src/renderer/src/i18n/locales/zh-TW.json
+@@ -553,6 +553,12 @@
+     "working": "處理中…"
+   },
+   "clone": {
++    "line_subtitles": "儲存音訊和 SRT（每行文字對應一條字幕）",
++    "download_pair": "儲存音訊和 SRT",
++    "batch_scripts": "{{count}} 個 TXT 檔案 · 按以下順序處理",
++    "batch_clear": "僅保留第一個檔案",
++    "batch_desktop": "批次匯出需要桌面應用程式。",
++    "batch_error": "無法儲存批次。請檢查輸出資料夾和音訊/SRT。",
+     "text_label": "文字",
+     "paste": "貼上",
+     "paste_failed": "剪貼簿存取遭到封鎖。請使用鍵盤直接貼上到文字欄位。",
+diff --git a/electron/src/renderer/src/lib/api/generate.test.ts b/electron/src/renderer/src/lib/api/generate.test.ts
+index 8894131..880eb79 100644
+--- a/electron/src/renderer/src/lib/api/generate.test.ts
++++ b/electron/src/renderer/src/lib/api/generate.test.ts
+@@ -129,7 +129,9 @@ describe('toGenerateForm', () => {
+   });
+   it('resolves best quality per engine and clamps explicit steps to its range', () => {
+     expect(toGenerateForm({ ...BASE_INPUT, steps: null }, 'omnivoice').get('num_step')).toBe('32');
+-    expect(toGenerateForm({ ...BASE_INPUT, steps: null }, 'supertonic3').get('num_step')).toBe('12');
++    expect(toGenerateForm({ ...BASE_INPUT, steps: null }, 'supertonic3').get('num_step')).toBe(
++      '12',
++    );
+     // Engines that ignore steps keep the old wire value.
+     expect(toGenerateForm({ ...BASE_INPUT, steps: null }, 'kittentts').get('num_step')).toBe('16');
+     expect(toGenerateForm({ ...BASE_INPUT, steps: 100 }, 'voxcpm2').get('num_step')).toBe('64');
+@@ -272,6 +274,7 @@ describe('parseGenerateHeaders', () => {
+     expect(parseGenerateHeaders(headers)).toEqual({
+       id: 'abc',
+       audioPath: 'abc.wav',
++      subtitlePath: null,
+       durationSeconds: 3.25,
+       genTimeSeconds: 1.5,
+       seed: 42,
+@@ -285,6 +288,7 @@ describe('parseGenerateHeaders', () => {
+     expect(parseGenerateHeaders(headers)).toEqual({
+       id: null,
+       audioPath: null,
++      subtitlePath: null,
+       durationSeconds: null,
+       genTimeSeconds: null,
+       seed: null,
+@@ -572,4 +576,27 @@ it('sends the saved profile and its reference text on the streaming route', asyn
+   const form = vi.mocked(fetch).mock.calls[0][1]?.body as FormData;
+   expect(form.get('profile_id')).toBe('saved-voice');
+   expect(form.get('ref_text')).toBe('Reference words');
+-});
+\ No newline at end of file
++});
++
++it('sends line timing explicitly and reads the generated SRT sidecar', async () => {
++  expect(toGenerateForm({ ...BASE_INPUT, subtitleLines: true }).get('subtitle_lines')).toBe('true');
++  expect(toGenerateForm(BASE_INPUT).get('subtitle_lines')).toBeNull();
++  vi.stubGlobal(
++    'fetch',
++    vi.fn(
++      async () =>
++        new Response('wav', {
++          headers: { 'X-Subtitle-Path': '12345678.srt' },
++        }),
++    ),
++  );
++  const result = await generateClone({ ...BASE_INPUT, subtitleLines: true });
++  expect(result.subtitlePath).toBe('12345678.srt');
++});
++it('does not offer an audio-only result when an old backend omits requested subtitles', async () => {
++  vi.stubGlobal(
++    'fetch',
++    vi.fn(async () => new Response('wav')),
++  );
++  await expect(generateClone({ ...BASE_INPUT, subtitleLines: true })).rejects.toThrow();
++});
+diff --git a/electron/src/renderer/src/lib/api/generate.ts b/electron/src/renderer/src/lib/api/generate.ts
+index 01ddf78..304d10a 100644
+--- a/electron/src/renderer/src/lib/api/generate.ts
++++ b/electron/src/renderer/src/lib/api/generate.ts
+@@ -146,12 +146,12 @@ function instructField(input: CloneGenerateInput): string {
+  */
+ export function toGenerateForm(
+   input: CloneGenerateInput,
+-  engineId: string | null | undefined = queryClient.getQueryData<EnginesResponse>(
+-    queryKeys.engines,
+-  )?.tts?.active,
++  engineId: string | null | undefined = queryClient.getQueryData<EnginesResponse>(queryKeys.engines)
++    ?.tts?.active,
+ ): FormData {
+   const form = new FormData();
+   form.append('text', input.text);
++  if (input.subtitleLines) form.append('subtitle_lines', 'true');
+   if (input.seed !== undefined && Number.isInteger(input.seed))
+     form.append('seed', String(input.seed));
+   // Auto must be explicit: omission inherits the saved profile's default.
+@@ -218,6 +218,7 @@ export function parseGenerateHeaders(headers: Headers): Omit<GenerateResult, 'bl
+   return {
+     id: headers.get('X-Audio-Id'),
+     audioPath: headers.get('X-Audio-Path'),
++    subtitlePath: headers.get('X-Subtitle-Path'),
+     durationSeconds: headerFloat(headers, 'X-Audio-Duration'),
+     genTimeSeconds: headerFloat(headers, 'X-Gen-Time'),
+     seed: headerInt(headers, 'X-Seed'),
+@@ -436,7 +437,10 @@ export async function generateClone(
+       signal: controller.signal,
+     });
+     const blob = await readAudioBody(res, opts.onProgress);
+-    return { blob, ...parseGenerateHeaders(res.headers) };
++    const metadata = parseGenerateHeaders(res.headers);
++    if (input.subtitleLines && !metadata.subtitlePath)
++      throw new Error(i18next.t('clone.download_failed', { message: 'SRT' }));
++    return { blob, ...metadata };
+   } finally {
+     finishActivity();
+     clearTimeout(backstop);
+diff --git a/electron/src/renderer/src/lib/api/types.ts b/electron/src/renderer/src/lib/api/types.ts
+index 2d9d28a..6f880a7 100644
+--- a/electron/src/renderer/src/lib/api/types.ts
++++ b/electron/src/renderer/src/lib/api/types.ts
+@@ -39,6 +39,7 @@ export interface Profile {
+ 
+ // ── History (`GET /history`) ───────────────────────────────────────────────
+ export interface HistoryItem {
++  subtitle_path?: string;
+   id: string;
+   text: string;
+   mode: string; // 'clone' | 'design' | ...
+@@ -169,6 +170,7 @@ export interface DesignRecipe {
+ /** Everything the clone form sends. Names are the UI names; `toGenerateForm`
+  *  in generate.ts maps them to the multipart field names. */
+ export interface CloneGenerateInput {
++  subtitleLines?: boolean;
+   /** Built-in voice id for engines that ship presets. */
+   presetVoice?: string;
+   wavBits?: 16 | 24 | 32;
+@@ -208,6 +210,8 @@ export interface CloneGenerateInput {
+ }
+ 
+ export interface GenerateResult {
++  subtitlePath?: string | null;
++  sourceName?: string;
+   blob: Blob;
+   /** X-Audio-Id */
+   id: string | null;
+diff --git a/electron/src/renderer/src/lib/export-history.ts b/electron/src/renderer/src/lib/export-history.ts
+index 63ffeb4..3a839f4 100644
+--- a/electron/src/renderer/src/lib/export-history.ts
++++ b/electron/src/renderer/src/lib/export-history.ts
+@@ -18,8 +18,8 @@ function exportMode(filename: string): 'audio' | 'video' | 'file' {
+  * deliberately non-fatal: a bookkeeping outage must not turn a written file
+  * into a failed export.
+  */
+-export async function saveExport(url: string, suggestedName: string) {
+-  const saved = await saveBackendFile({ url, suggestedName });
++export async function saveExport(url: string, suggestedName: string, subtitleUrl?: string) {
++  const saved = await saveBackendFile({ url, suggestedName, subtitleUrl });
+   if (!saved) return null;
+   if (!saved.canceled && saved.path) {
+     try {
+diff --git a/electron/src/renderer/src/lib/store/clone-scripts.ts b/electron/src/renderer/src/lib/store/clone-scripts.ts
+new file mode 100644
+index 0000000..0f4191e
+--- /dev/null
++++ b/electron/src/renderer/src/lib/store/clone-scripts.ts
+@@ -0,0 +1,12 @@
++import { Store } from '@tanstack/store';
++import { useStore } from '@tanstack/react-store';
++
++export interface CloneScript {
++  sourceName: string;
++  text: string;
++}
++/** Session-only: importing large scripts must not fill localStorage. */
++export const cloneScriptsStore = new Store<CloneScript[]>([]);
++export const useCloneScripts = () => useStore(cloneScriptsStore);
++export const setCloneScripts = (scripts: CloneScript[]) =>
++  cloneScriptsStore.setState(() => scripts);
+diff --git a/electron/src/renderer/src/lib/store/clone-settings.ts b/electron/src/renderer/src/lib/store/clone-settings.ts
+index 82a5b16..ca83cdb 100644
+--- a/electron/src/renderer/src/lib/store/clone-settings.ts
++++ b/electron/src/renderer/src/lib/store/clone-settings.ts
+@@ -21,6 +21,9 @@ export const STEPS_MIGRATED_STORAGE_KEY = 'voicestudio.clone.steps-quality-first
+ const PERSIST_DEBOUNCE_MS = 250;
+ 
+ export interface CloneSettings {
++  sourceName: string;
++  subtitleLines: boolean;
++  batchAudioFormat: 'wav' | 'mp3';
+   text: string;
+   /** Display name; 'Auto' is omitted on the wire. */
+   language: string;
+@@ -57,6 +60,9 @@ export interface CloneSettings {
+ }
+ 
+ export const DEFAULT_CLONE_SETTINGS: CloneSettings = {
++  sourceName: '',
++  subtitleLines: false,
++  batchAudioFormat: 'wav',
+   text: '',
+   language: 'Auto',
+   refText: '',
+@@ -87,6 +93,7 @@ export const DEFAULT_CLONE_SETTINGS: CloneSettings = {
+ 
+ /** Whether `value` is a valid stored value for the clone setting `key`. */
+ export function acceptsCloneSetting(key: keyof CloneSettings, value: unknown): boolean {
++  if (key === 'batchAudioFormat') return value === 'wav' || value === 'mp3';
+   if (key === 'emotionMode') return value === 'none' || value === 'text' || value === 'vector';
+   if (key === 'emotionText' || key === 'direction')
+     return typeof value === 'string' && value.length <= 500;
+diff --git a/electron/src/renderer/src/lib/store/takes.test.ts b/electron/src/renderer/src/lib/store/takes.test.ts
+index bf62760..8bcb0c4 100644
+--- a/electron/src/renderer/src/lib/store/takes.test.ts
++++ b/electron/src/renderer/src/lib/store/takes.test.ts
+@@ -177,6 +177,9 @@ describe('take metadata', () => {
+   });
+   it('restores every generation control the clone form stores', () => {
+     const changed: CloneSettings = {
++      sourceName: 'Bai_01',
++      batchAudioFormat: 'wav',
++      subtitleLines: true,
+       text: 'ignored: history text wins',
+       language: 'ignored',
+       refText: 'reference words',
+diff --git a/electron/tests/txt-srt-smoke.mjs b/electron/tests/txt-srt-smoke.mjs
+new file mode 100644
+index 0000000..7be86d1
+--- /dev/null
++++ b/electron/tests/txt-srt-smoke.mjs
+@@ -0,0 +1,75 @@
++import assert from 'node:assert/strict';
++import { chromium } from 'playwright';
++import { DEFAULT_FIXTURES } from './fake-health-backend.mjs';
++
++const browser = await chromium.launch({ executablePath: process.env.CHROMIUM_PATH || '/usr/bin/chromium', headless: true });
++const page = await browser.newPage({ bypassCSP: true, viewport: { width: 1440, height: 1000 } });
++const errors = [];
++page.on('pageerror', e => errors.push(e.message));
++const profile = { id: 'voice-1', name: 'ADAM', kind: 'clone', ref_audio_path: 'ref.wav', ref_text: 'Reference text' };
++const engine = { id: 'omnivoice', display_name: 'OmniVoice', available: true, supports_cloning: true,
++  supported_languages: ['English','Japanese','Korean','German','Spanish'] };
++const fixtures = Object.fromEntries(Object.entries(DEFAULT_FIXTURES).map(([p,v]) => ['/api'+p,v]));
++Object.assign(fixtures, {
++  '/api/health': { status: 'ok' }, '/api/setup/status': { models_ready: true, ready: true, missing: [] },
++  '/api/profiles': [profile], '/api/models': { models: [] },
++  '/api/model/status': { status: 'ready', loading: false },
++  '/api/engines': { tts: { active: 'omnivoice', backends: [engine] }, asr: { active: '', backends: [] }, llm: { active: '', backends: [] } },
++});
++const requests = [];
++const wav = Buffer.alloc(44 + 48000);
++wav.write('RIFF',0);wav.writeUInt32LE(wav.length-8,4);wav.write('WAVEfmt ',8);wav.writeUInt32LE(16,16);
++wav.writeUInt16LE(1,20);wav.writeUInt16LE(1,22);wav.writeUInt32LE(24000,24);wav.writeUInt32LE(48000,28);wav.writeUInt16LE(2,32);wav.writeUInt16LE(16,34);wav.write('data',36);wav.writeUInt32LE(48000,40);
++await page.addInitScript(() => { localStorage.setItem('voicestudio.setup.complete.v1','1'); localStorage.setItem('voicestudio.locale','vi'); });
++await page.route('**/api/**', async route => {
++  const req=route.request();const path=new URL(req.url()).pathname;
++  if (!path.startsWith('/api/')) return route.continue();
++  if(path==='/api/generate') {
++    const form=await new Response(req.postDataBuffer(),{headers:{'content-type':req.headers()['content-type']}}).formData();
++    requests.push({text:form.get('text'),subtitles:form.get('subtitle_lines'),profile:form.get('profile_id')});
++    return route.fulfill({body:wav,contentType:'audio/wav',headers:{'X-Audio-Id':'12345678','X-Audio-Path':'12345678.wav','X-Subtitle-Path':'12345678.srt','X-Audio-Duration':'1','X-Gen-Time':'0.1'}});
++  }
++  if(path.startsWith('/api/audio/')) return route.fulfill({body:wav,contentType:'audio/wav'});
++  return route.fulfill({ json: fixtures[path] ?? {} });
++});
++try {
++  await page.goto('http://localhost:3912/#/clone');
++  await page.evaluate(async () => {
++    const { patchCloneSettings }=await import('/src/lib/store/clone-settings.ts');
++    patchCloneSettings({selectedProfileId:'voice-1',text:'Ready',language:'English',autoPlay:false});
++  });
++  await page.locator('[data-clone-script]').waitFor();
++  await page.evaluate(() => {
++    window.__saveCalls=[];window.__batchBegins=0;window.__batchEnds=0;
++    window.voicestudio={app:{platform:'win32',version:'0.5.8'},files:{
++      beginBatchExport:async()=>{window.__batchBegins++;return 'chosen-folder'},
++      endBatchExport:async()=>{window.__batchEnds++},
++      saveAudio:async req=>{window.__saveCalls.push(req);return {canceled:false,path:'D:\\Output\\'+req.suggestedName}},
++      revealPath:async()=>{},
++    }};
++  });
++  await page.locator('input[type=file][accept=".txt,.md,.markdown,.doc,.docx,.pdf,.epub"]').setInputFiles([
++    {name:'Bai_02.txt',mimeType:'text/plain',buffer:Buffer.from('Second file.\nAnother line.')},
++    {name:'Bai_01.txt',mimeType:'text/plain',buffer:Buffer.from('First file.\nSecond line.')},
++  ]);
++  await page.getByText('Bai_01.txt',{exact:true}).waitFor();
++  assert.equal(await page.locator('[data-clone-script]').inputValue(),'First file.\nSecond line.');
++  assert.equal(await page.getByRole('checkbox',{name:/SRT/}).isChecked(),true);
++  await page.getByRole('button',{name:'MP3 + SRT',exact:true}).click();
++  await page.screenshot({path:process.env.TXT_SRT_SCREENSHOT || '/workspace/work/txt-srt-batch.png',fullPage:true});
++  await page.keyboard.press('Control+Enter');
++  await page.waitForFunction(()=>window.__batchEnds===1,{timeout:15000});
++  const saves=await page.evaluate(()=>window.__saveCalls);
++  assert.deepEqual(saves.map(x=>x.suggestedName),['Bai_01.mp3','Bai_02.mp3']);
++  assert.equal(await page.evaluate(()=>window.__batchBegins),1);
++  assert.deepEqual(requests.map(x=>x.text.replace(/\r\n/g,'\n')),['First file.\nSecond line.','Second file.\nAnother line.']);
++  assert.ok(requests.every(x=>x.subtitles==='true'&&x.profile==='voice-1'));
++  await page.getByRole('button',{name:'Lưu âm thanh + SRT',exact:true}).click();
++  await page.waitForFunction(()=>window.__saveCalls.length===3);
++  const manual=await page.evaluate(()=>window.__saveCalls.at(-1));
++  assert.equal(manual.suggestedName,'Bai_02.wav');
++  assert.equal(manual.subtitleUrl,'/api/audio/12345678.srt');
++  assert.equal(manual.batchToken,undefined);
++  assert.deepEqual(errors,[]);
++  console.log('PASS: Vietnamese clone UI, ordered TXT import, one folder, MP3+SRT batch, and WAV+SRT through the existing Save button.');
++} catch (error) { console.log('UI_ERRORS', errors); console.log((await page.locator('body').innerText()).slice(0,6000)); await page.screenshot({path:'/workspace/work/txt-srt-failure.png'}); throw error; } finally { await browser.close(); }
+diff --git a/packaging/txt-srt/RESTORE.cmd b/packaging/txt-srt/RESTORE.cmd
+new file mode 100644
+index 0000000..2b33a88
+--- /dev/null
++++ b/packaging/txt-srt/RESTORE.cmd
+@@ -0,0 +1,4 @@
++@echo off
++powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File "%~dp0Update-VoiceStudio.ps1" -Restore
++echo.
++pause
+diff --git a/packaging/txt-srt/UPDATE.cmd b/packaging/txt-srt/UPDATE.cmd
+new file mode 100644
+index 0000000..9a7b2bb
+--- /dev/null
++++ b/packaging/txt-srt/UPDATE.cmd
+@@ -0,0 +1,4 @@
++@echo off
++powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File "%~dp0Update-VoiceStudio.ps1"
++echo.
++pause
+diff --git a/packaging/txt-srt/Update-VoiceStudio.ps1 b/packaging/txt-srt/Update-VoiceStudio.ps1
+new file mode 100644
+index 0000000..bd52146
+--- /dev/null
++++ b/packaging/txt-srt/Update-VoiceStudio.ps1
+@@ -0,0 +1,135 @@
++﻿param([string]$InstallDirectory = '', [switch]$Restore, [switch]$VerifyOnly)
++$ErrorActionPreference = 'Stop'
++$package = Split-Path -Parent $MyInvocation.MyCommand.Path
++$manifest = Get-Content -LiteralPath (Join-Path $package 'manifest.json') -Raw | ConvertFrom-Json
++function Hash([string]$path) { (Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash.ToLowerInvariant() }
++function PayloadPath([string]$relative) { Join-Path (Join-Path $package 'payload') $relative }
++# Validate the entire payload before asking for or changing an installation.
++foreach ($entry in $manifest.files) {
++    $source = PayloadPath $entry.path
++    if (!(Test-Path -LiteralPath $source -PathType Leaf) -or (Hash $source) -ne $entry.patched) {
++        throw "Package is incomplete or damaged: $($entry.path). Extract the whole ZIP again."
++    }
++}
++if ($VerifyOnly) { Write-Host 'Payload checksums verified.'; exit 0 }
++if ($env:OS -ne 'Windows_NT') { throw 'This updater is for Windows x64.' }
++Add-Type -AssemblyName System.Windows.Forms
++if (!$InstallDirectory) {
++    $locations = @(
++        (Join-Path $env:LOCALAPPDATA 'Programs\VoiceStudio'),
++        (Join-Path $env:LOCALAPPDATA 'VoiceStudio'),
++        (Join-Path $env:ProgramFiles 'VoiceStudio')
++    )
++    $InstallDirectory = $locations | Where-Object { Test-Path -LiteralPath (Join-Path $_ 'resources\app.asar') } | Select-Object -First 1
++    if (!$InstallDirectory) {
++        $picker = New-Object System.Windows.Forms.FolderBrowserDialog
++        $picker.Description = 'Choose the folder containing VoiceStudio.exe (not the model/data folder).'
++        if ($picker.ShowDialog() -ne [System.Windows.Forms.DialogResult]::OK) { exit 0 }
++        $InstallDirectory = $picker.SelectedPath
++        $picker.Dispose()
++    }
++}
++$InstallDirectory = [IO.Path]::GetFullPath($InstallDirectory)
++$resources = Join-Path $InstallDirectory 'resources'
++if (!(Test-Path -LiteralPath (Join-Path $InstallDirectory 'VoiceStudio.exe')) -or !(Test-Path -LiteralPath (Join-Path $resources 'app.asar'))) {
++    throw 'This is not a VoiceStudio desktop installation.'
++}
++if (Get-Process -Name 'VoiceStudio' -ErrorAction SilentlyContinue) {
++    throw 'Close VoiceStudio completely (including its tray icon), then run the updater again.'
++}
++if ($Restore) {
++    $backup = Get-ChildItem -LiteralPath $resources -Directory -Filter 'txt-srt-backup-*' |
++        Where-Object { Test-Path -LiteralPath (Join-Path $_.FullName 'backup.json') } |
++        Sort-Object Name -Descending | Select-Object -First 1
++    if (!$backup) { throw 'No TXT-SRT backup was found.' }
++    $record = Get-Content -LiteralPath (Join-Path $backup.FullName 'backup.json') -Raw | ConvertFrom-Json
++    # Refuse to roll an unrelated app update back to an older shell.
++    foreach ($entry in $record.files) {
++        $target = Join-Path $resources $entry.path
++        if (Test-Path -LiteralPath $target) {
++            $current = Hash $target
++            if ($current -ne $entry.patched -and $current -ne $entry.original) {
++                throw "File changed after this update: $($entry.path). No files restored."
++            }
++        }
++        if ($entry.existed) {
++            $saved = Join-Path $backup.FullName $entry.path
++            if (!(Test-Path -LiteralPath $saved) -or (Hash $saved) -ne $entry.original) {
++                throw 'Backup is incomplete or damaged. No files restored.'
++            }
++        }
++    }
++    foreach ($entry in $record.files) {
++        $target = Join-Path $resources $entry.path
++        if ($entry.existed) { Copy-Item -LiteralPath (Join-Path $backup.FullName $entry.path) -Destination $target -Force }
++        elseif (Test-Path -LiteralPath $target) { Remove-Item -LiteralPath $target -Force }
++    }
++    Write-Host "Original app files restored. Backup: $($backup.FullName)"
++    exit 0
++}
++$alreadyInstalled = $true
++foreach ($entry in $manifest.files) {
++    $target = Join-Path $resources $entry.path
++    if (!(Test-Path -LiteralPath $target) -or (Hash $target) -ne $entry.patched) { $alreadyInstalled = $false }
++}
++if ($alreadyInstalled) { Write-Host 'TXT + Audio/SRT integration is already installed.'; exit 0 }
++# Only the exact official 0.5.8 x64 baseline is eligible. No model/runtime setup.
++foreach ($entry in $manifest.files) {
++    $target = Join-Path $resources $entry.path
++    if ($null -eq $entry.original) {
++        if (Test-Path -LiteralPath $target) { throw "An unexpected custom file exists: $($entry.path). No changes made." }
++    } elseif (!(Test-Path -LiteralPath $target) -or (Hash $target) -ne $entry.original) {
++        throw "This updater needs the unmodified official VoiceStudio 0.5.8 Windows x64 app. Different file: $($entry.path). No changes made."
++    }
++}
++$backupDir = Join-Path $resources ('txt-srt-backup-' + (Get-Date -Format 'yyyyMMdd-HHmmss') + '-' + [guid]::NewGuid().ToString('N').Substring(0,6))
++New-Item -ItemType Directory -Path $backupDir | Out-Null
++$records = @()
++foreach ($entry in $manifest.files) {
++    $target = Join-Path $resources $entry.path
++    $existed = Test-Path -LiteralPath $target
++    if ($existed) {
++        $saved = Join-Path $backupDir $entry.path
++        New-Item -ItemType Directory -Path (Split-Path -Parent $saved) -Force | Out-Null
++        Copy-Item -LiteralPath $target -Destination $saved
++        if ((Hash $saved) -ne $entry.original) { throw 'Backup verification failed. Original app has not been modified.' }
++    }
++    $records += [pscustomobject]@{ path=$entry.path; original=$entry.original; patched=$entry.patched; existed=$existed }
++}
++@{ files=$records } | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath (Join-Path $backupDir 'backup.json') -Encoding UTF8
++$changed = @()
++$tempFiles = @()
++try {
++    foreach ($entry in $manifest.files) {
++        $target = Join-Path $resources $entry.path
++        New-Item -ItemType Directory -Path (Split-Path -Parent $target) -Force | Out-Null
++        $temporary = $target + '.txt-srt-' + [guid]::NewGuid().ToString('N') + '.tmp'
++        $tempFiles += $temporary
++        Copy-Item -LiteralPath (PayloadPath $entry.path) -Destination $temporary
++        if ((Hash $temporary) -ne $entry.patched) { throw 'Staged file checksum failed.' }
++        $changed += $entry.path
++        Move-Item -LiteralPath $temporary -Destination $target -Force
++    }
++    foreach ($entry in $manifest.files) {
++        if ((Hash (Join-Path $resources $entry.path)) -ne $entry.patched) { throw 'Installed checksum failed.' }
++    }
++} catch {
++    $failure = $_
++    $rollbackFailed = @()
++    foreach ($relative in $changed) {
++        try {
++            $entry = $records | Where-Object { $_.path -eq $relative } | Select-Object -First 1
++            $target = Join-Path $resources $relative
++            if ($entry.existed) { Copy-Item -LiteralPath (Join-Path $backupDir $relative) -Destination $target -Force }
++            elseif (Test-Path -LiteralPath $target) { Remove-Item -LiteralPath $target -Force }
++        } catch { $rollbackFailed += $relative }
++    }
++    if ($rollbackFailed.Count) { Write-Warning "Restore these files from $backupDir : $($rollbackFailed -join ', ')" }
++    throw $failure
++} finally {
++    foreach ($temporary in $tempFiles) { if (Test-Path -LiteralPath $temporary) { Remove-Item -LiteralPath $temporary -Force } }
++}
++Write-Host 'Updated. Open VoiceStudio, import TXT in Voice cloning, synthesize, then Save audio + SRT.'
++Write-Host 'For multiple TXT files: select WAV/MP3 + SRT, synthesize, then choose one output folder.'
++Write-Host "Backup kept at: $backupDir"
++Write-Host 'Saved voices, models, projects, settings and license acceptances were not changed.'
+diff --git a/tests/test_line_subtitle_finalize.py b/tests/test_line_subtitle_finalize.py
+new file mode 100644
+index 0000000..4e71560
+--- /dev/null
++++ b/tests/test_line_subtitle_finalize.py
+@@ -0,0 +1,93 @@
++"""Exercise the actual finalizer with real files and no model downloads."""
++import ast
++import asyncio
++import contextlib
++import io
++import logging
++import os
++from pathlib import Path
++import sqlite3
++import tempfile
++import time
++import types
++import unittest
++from unittest.mock import patch
++import uuid
++import wave
++
++SOURCE = Path(__file__).parents[1] / 'backend/api/routers/generation.py'
++
++
++class SubtitleFinalizationTests(unittest.TestCase):
++    def setUp(self):
++        self.tmp = tempfile.TemporaryDirectory()
++        self.addCleanup(self.tmp.cleanup)
++        self.outputs = Path(self.tmp.name)
++        self.events = []
++        tree = ast.parse(SOURCE.read_text())
++        finalizer = next(node for node in tree.body if isinstance(node, ast.AsyncFunctionDef) and node.name == '_finalize_generation')
++        namespace = dict(asyncio=asyncio, time=time, uuid=uuid, Path=Path, os=os, sqlite3=sqlite3,
++                         OUTPUTS_DIR=str(self.outputs), logger=logging.getLogger('test'),
++                         take_reference_transcript=lambda x: x)
++        def save(path, tensor, rate, bits):
++            with wave.open(str(path),'wb') as wav:
++                wav.setparams((1,2,rate,0,'NONE','not compressed'))
++                wav.writeframes(b'\0\0'*tensor.shape[-1])
++        @contextlib.contextmanager
++        def db_conn():
++            test=self
++            class DB:
++                def execute(self, *args):
++                    # A take must not be published to history before its two files exist.
++                    if test.expected_srt:
++                        assert len(list(test.outputs.glob('*.wav')))==1
++                        assert len(list(test.outputs.glob('*.srt')))==1
++                    test.events.append('history')
++            yield DB()
++        namespace.update(save_generation_wav=save, db_conn=db_conn,
++                         _prune_history_over_cap=lambda **_: None,
++                         event_bus=types.SimpleNamespace(emit=lambda *args: self.events.append('published')))
++        exec(compile(ast.Module(body=[finalizer],type_ignores=[]),str(SOURCE),'exec'), namespace)
++        self.finalize=namespace['_finalize_generation']
++        self.expected_srt = True
++        self.tensor=types.SimpleNamespace(shape=(1,24000))
++
++    def run_finalize(self, **kwargs):
++        async def mark(tensor,*args,**kw): return tensor
++        watermark=types.ModuleType('services.watermark');watermark.mark_synthetic_async=mark
++        # Only the model-free finalizer is loaded; no Torch or app startup required.
++        services=types.ModuleType('services');services.__path__=[]
++        with patch.dict('sys.modules',{'services':services,'services.watermark':watermark}):
++            return asyncio.run(self.finalize(self.tensor,24000,text='Sentence',history_mode='clone',
++                ref_audio_path='reference.wav',language='English',instruct='',resolved_profile_id='voice',
++                used_seed=1,start_time=time.time(),include_wav_bytes=True,**kwargs))
++
++    def test_both_files_exist_before_history_publish(self):
++        _, meta=self.run_finalize(subtitle_srt='1\n00:00:00,000 --> 00:00:01,000\nSentence\n',subtitle_frames=24000)
++        self.assertEqual(self.events,['history','published'])
++        self.assertEqual((self.outputs/f'{meta["id"]}.srt').read_text(encoding='utf-8-sig').splitlines()[-1],'Sentence')
++        with wave.open(io.BytesIO(meta['_wav_bytes'])) as wav:
++            self.assertEqual(wav.getnframes(),24000)
++
++    def test_changed_final_length_never_publishes_wrong_subtitles(self):
++        with self.assertRaises(ValueError): self.run_finalize(subtitle_srt='subtitles',subtitle_frames=48000)
++        self.assertEqual(list(self.outputs.iterdir()),[])
++        self.assertEqual(self.events,[])
++
++    def test_subtitle_write_failure_removes_audio_before_publish(self):
++        original=Path.open
++        def fail(path,*args,**kwargs):
++            if path.suffix=='.srt': raise OSError('disk full')
++            return original(path,*args,**kwargs)
++        with patch.object(Path,'open',fail):
++            with self.assertRaises(OSError): self.run_finalize(subtitle_srt='subtitles',subtitle_frames=24000)
++        self.assertEqual(list(self.outputs.iterdir()),[])
++        self.assertEqual(self.events,[])
++
++    def test_standard_audio_generation_does_not_create_a_sidecar(self):
++        self.expected_srt=False
++        self.run_finalize()
++        self.assertEqual(len(list(self.outputs.glob('*.wav'))),1)
++        self.assertEqual(list(self.outputs.glob('*.srt')),[])
++
++if __name__=='__main__': unittest.main()
+diff --git a/tests/test_line_subtitles.py b/tests/test_line_subtitles.py
+new file mode 100644
+index 0000000..1a58cd8
+--- /dev/null
++++ b/tests/test_line_subtitles.py
+@@ -0,0 +1,45 @@
++"""No models, GPU or downloads: clocks use actual generated sample counts."""
++import sys
++from pathlib import Path
++import unittest
++sys.path.insert(0, str(Path(__file__).parents[1] / 'backend'))
++from services.line_subtitles import LineClock, script_lines, timestamp
++
++
++class LineSubtitleTests(unittest.TestCase):
++    def test_source_lines_and_sample_clock(self):
++        lines = script_lines('First sentence.\r\n\r\nSecond sentence.\rThird sentence.\n')
++        clock = LineClock(lines)
++        for frames in (12000, 24000, 36000):
++            clock.append(frames, 24000)
++        self.assertEqual(clock.srt(),
++            '1\n00:00:00,000 --> 00:00:00,500\nFirst sentence.\n\n'
++            '2\n00:00:00,500 --> 00:00:01,500\nSecond sentence.\n\n'
++            '3\n00:00:01,500 --> 00:00:03,000\nThird sentence.\n')
++
++    def test_fractional_rate_does_not_accumulate_rounding_errors(self):
++        clock = LineClock(['sentence'] * 1000)
++        for _ in range(1000): clock.append(1001, 44100)
++        self.assertEqual(clock.frames, 1001000)
++        self.assertIn(timestamp(1001000, 44100), clock.srt().splitlines()[-2])
++
++    def test_unicode_original_text(self):
++        text = '\u65e5\u672c\u8a9e\n\ud55c\uad6d\uc5b4\nEspañol'
++        clock = LineClock(script_lines(text))
++        for _ in range(3): clock.append(24000,24000)
++        self.assertTrue(all(line in clock.srt() for line in text.splitlines()))
++
++    def test_empty_and_incomplete_are_rejected(self):
++        for clock in (LineClock([]), LineClock(['a'])):
++            with self.assertRaises(ValueError): clock.srt()
++
++    def test_zero_audio_and_rate_changes_are_rejected(self):
++        clock=LineClock(['a','b'])
++        with self.assertRaises(ValueError): clock.append(0,24000)
++        clock.append(24000,24000)
++        with self.assertRaises(ValueError): clock.append(48000,48000)
++
++    def test_timing_after_one_hour(self):
++        self.assertEqual(timestamp(44100*3600+22050,44100),'01:00:00,500')
++
++if __name__ == '__main__': unittest.main()
+diff --git a/tests/test_txt_srt_updater.py b/tests/test_txt_srt_updater.py
+new file mode 100644
+index 0000000..65a159c
+--- /dev/null
++++ b/tests/test_txt_srt_updater.py
+@@ -0,0 +1,82 @@
++"""Cross-platform logic tests; no real Windows app or user data is touched."""
++import hashlib
++import json
++import os
++from pathlib import Path
++import shutil
++import subprocess
++import tempfile
++import unittest
++
++SCRIPT = Path(__file__).parents[1] / 'packaging/txt-srt/Update-VoiceStudio.ps1'
++PWSH = os.environ.get('TXT_SRT_PWSH') or shutil.which('pwsh')
++
++@unittest.skipUnless(PWSH, 'PowerShell is required for updater logic tests')
++class UpdaterTests(unittest.TestCase):
++    def setUp(self):
++        self.temp=tempfile.TemporaryDirectory();self.addCleanup(self.temp.cleanup)
++        root=Path(self.temp.name);self.package=root/'package';self.app=root/'app';self.resources=self.app/'resources'
++        self.package.mkdir();self.resources.mkdir(parents=True);(self.app/'VoiceStudio.exe').write_bytes(b'fixture only')
++        shutil.copy2(SCRIPT,self.package/SCRIPT.name)
++        self.entries=[]
++        for rel in ['app.asar','backend/api/routers/generation.py','backend/core/csrf.py','backend/services/line_subtitles.py']:
++            payload=self.package/'payload'/rel;payload.parent.mkdir(parents=True,exist_ok=True)
++            payload.write_bytes(('updated '+rel).encode())
++            original=None
++            if not rel.endswith('line_subtitles.py'):
++                target=self.resources/rel;target.parent.mkdir(parents=True,exist_ok=True)
++                target.write_bytes(('original '+rel).encode());original=self.digest(target)
++            self.entries.append(dict(path=rel,patched=self.digest(payload),original=original))
++        (self.package/'manifest.json').write_text(json.dumps(dict(files=self.entries)))
++
++    @staticmethod
++    def digest(path):return hashlib.sha256(path.read_bytes()).hexdigest()
++
++    def run_updater(self, restore=False, prelude=''):
++        # Only Forms loading is stubbed. With an explicit directory no dialog is executed.
++        command="$ErrorActionPreference='Stop'; function Add-Type { param([string]$AssemblyName) }; $env:OS='Windows_NT'; "
++        command+=prelude+f" & '{self.package/SCRIPT.name}' -InstallDirectory '{self.app}'"+(' -Restore' if restore else '')
++        env=dict(os.environ,XDG_CACHE_HOME=str(self.package/'cache'),XDG_CONFIG_HOME=str(self.package/'config'),XDG_DATA_HOME=str(self.package/'data'))
++        return subprocess.run([PWSH,'-NoProfile','-Command',command],capture_output=True,text=True,env=env)
++
++    def assert_original(self):
++        for entry in self.entries:
++            target=self.resources/entry['path']
++            if entry['original'] is None:self.assertFalse(target.exists())
++            else:self.assertEqual(self.digest(target),entry['original'])
++
++    def test_install_idempotence_and_restore(self):
++        result=self.run_updater();self.assertEqual(result.returncode,0,result.stdout+result.stderr)
++        for entry in self.entries:self.assertEqual(self.digest(self.resources/entry['path']),entry['patched'])
++        result=self.run_updater();self.assertEqual(result.returncode,0,result.stderr)
++        self.assertEqual(len(list(self.resources.glob('txt-srt-backup-*'))),1)
++        result=self.run_updater(restore=True);self.assertEqual(result.returncode,0,result.stdout+result.stderr)
++        self.assert_original()
++
++    def test_corrupt_package_is_rejected_before_app_changes(self):
++        (self.package/'payload/app.asar').write_bytes(b'corrupt')
++        self.assertNotEqual(self.run_updater().returncode,0);self.assert_original()
++        self.assertEqual(list(self.resources.glob('txt-srt-backup-*')),[])
++
++    def test_other_installed_version_is_not_modified(self):
++        target=self.resources/'app.asar';target.write_bytes(b'other version')
++        self.assertNotEqual(self.run_updater().returncode,0)
++        self.assertEqual(target.read_bytes(),b'other version')
++        self.assertEqual(list(self.resources.glob('txt-srt-backup-*')),[])
++
++    def test_write_failure_rolls_back_previous_updated_files(self):
++        prelude=r'''function Copy-Item {
++            param([string]$LiteralPath,[string]$Destination,[switch]$Force)
++            if ($Destination -like '*csrf.py.txt-srt-*.tmp') { throw 'simulated disk failure' }
++            Microsoft.PowerShell.Management\Copy-Item @PSBoundParameters
++        };'''
++        result=self.run_updater(prelude=prelude);self.assertNotEqual(result.returncode,0)
++        self.assert_original()
++
++    def test_restore_does_not_overwrite_a_subsequent_app_update(self):
++        self.assertEqual(self.run_updater().returncode,0)
++        (self.resources/'app.asar').write_bytes(b'later app version')
++        self.assertNotEqual(self.run_updater(restore=True).returncode,0)
++        self.assertEqual((self.resources/'app.asar').read_bytes(),b'later app version')
++
++if __name__=='__main__':unittest.main()
