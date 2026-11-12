@@ -20,14 +20,14 @@ $form.Font = New-Object Drawing.Font('Segoe UI',10)
 $layout = New-Object Windows.Forms.TableLayoutPanel
 $layout.Dock = 'Fill'; $layout.Padding = New-Object Windows.Forms.Padding(16)
 $layout.ColumnCount = 1; $layout.RowCount = 7
-@(75,32,0,48,28,0,32) | ForEach-Object {
+@(100,32,0,48,28,0,32) | ForEach-Object {
     $style = New-Object Windows.Forms.RowStyle
     if ($_ -eq 0) { $style.SizeType='Percent'; $style.Height=50 } else { $style.SizeType='Absolute'; $style.Height=$_ }
     $layout.RowStyles.Add($style) | Out-Null
 }
 $form.Controls.Add($layout)
 $header = New-Object Windows.Forms.FlowLayoutPanel
-$header.Dock='Fill';$header.WrapContents=$true
+$header.Dock='Fill';$header.WrapContents=$false;$header.FlowDirection='TopDown'
 $export = New-Object Windows.Forms.Button
 $export.Text='1. Xuất KHÓA CÔNG KHAI để tạo app'; $export.AutoSize=$true; $export.Padding=New-Object Windows.Forms.Padding(8)
 $header.Controls.Add($export)
