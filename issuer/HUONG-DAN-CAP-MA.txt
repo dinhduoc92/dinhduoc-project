@@ -1,0 +1,35 @@
+ĐÌNH ĐƯỢC- VOICE STUDIO — CÔNG CỤ CẤP MÃ CHO CHỦ APP
+
+CHỈ BẠN GIỮ CÔNG CỤ NÀY. Không gửi gói này cho bạn bè.
+Gói tải về không chứa khóa bí mật của bạn. Khóa được tạo trên máy bạn khi mở lần đầu.
+
+BƯỚC ĐẦU TIÊN (để hoàn tất app dành cho bạn bè)
+1. Giải nén toàn bộ ZIP.
+2. Nhấp đúp MO-CONG-CU-CAP-MA.cmd trên Windows.
+3. Trong cửa sổ, bấm “1. Xuất KHÓA CÔNG KHAI để tạo app”.
+4. Lưu file DINH-DUOC-PUBLIC-KEY.json và gửi file JSON đó lại trong cuộc trò chuyện.
+File JSON này chỉ dùng kiểm tra chữ ký, có thể chia sẻ để đóng gói app. Nó không cấp được mã.
+Không gửi file owner-key.dpapi. Không xóa file khóa để tạo khóa mới sau khi đã đóng gói app.
+
+KHI APP DÀNH CHO BẠN BÈ ĐÃ ĐƯỢC ĐÓNG GÓI
+1. Người dùng mở app, gửi bạn mã máy dạng A1B2-C3D4-E5F6-0718.
+2. Dán mỗi mã máy một dòng. Có thể thêm ghi chú tên người dùng sau mã máy.
+3. Chọn “Hết hạn sau” và nhập số ngày (mặc định 30), hoặc “Vĩnh viễn”.
+4. Bấm Tạo mã, Copy kết quả hoặc Lưu kết quả TXT.
+5. Gửi mã kích hoạt tương ứng cho từng người. Họ dán mã vào màn hình kích hoạt của app.
+
+Hạn dùng bắt đầu khi bạn tạo mã, không phải lúc người dùng nhập mã.
+Mã kích hoạt gắn với máy và khóa của bạn; người khác không tự cấp mã hợp lệ chỉ bằng app.
+Kích hoạt dự kiến dùng offline; việc thu hồi từ xa cần bổ sung máy chủ.
+
+GIỮ KHÓA CẤP MÃ
+Khóa riêng được Windows bảo vệ bằng DPAPI CurrentUser và lưu ở:
+%LOCALAPPDATA%\DinhDuocVoiceStudioIssuer\owner-key.dpapi
+Công cụ không tải khóa này lên mạng và không có nút xuất khóa riêng.
+Hãy dùng cùng tài khoản Windows đã tạo khóa. Khóa DPAPI gắn với hồ sơ Windows,
+nên chỉ sao chép file này sang máy/tài khoản khác sẽ không đủ để mở lại khóa.
+Trước khi cài lại Windows, cần chuẩn bị phương án chuyển khóa; đừng xóa hồ sơ cũ.
+Nếu mất khóa, phải tạo bộ khóa mới và đóng gói lại app; mã từ bộ khóa cũ không dùng được với app mới.
+
+Đây là công cụ quản trị riêng. App bạn bè sẽ được đóng gói sau khi nhận khóa công khai.
+Bản quyền VoiceStudio và các mô hình vẫn giữ nguyên như đã nêu trước đó.

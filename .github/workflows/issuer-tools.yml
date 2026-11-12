@@ -1,0 +1,59 @@
+name: Build Dinh Duoc owner activation tool
+on:
+  push:
+    branches: [dinhduoc-voice-studio-activation]
+    paths: ['issuer/**', 'licensing/**', '.github/workflows/issuer-tools.yml']
+  workflow_dispatch:
+permissions:
+  contents: write
+jobs:
+  owner-tool:
+    runs-on: windows-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - name: Test Windows PowerShell 5.1 signing and DPAPI persistence
+        shell: pwsh
+        run: |
+          powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File issuer/Test-Issuer.ps1 -FixtureDirectory "$env:RUNNER_TEMP/issuer-ps51"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          node issuer/verify-fixture.mjs "$env:RUNNER_TEMP/issuer-ps51"
+      - name: Test PowerShell 7 signing compatibility
+        shell: pwsh
+        run: |
+          ./issuer/Test-Issuer.ps1 -FixtureDirectory "$env:RUNNER_TEMP/issuer-ps7"
+          node issuer/verify-fixture.mjs "$env:RUNNER_TEMP/issuer-ps7"
+      - name: Render and test the owner's desktop interface
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Path dist -Force | Out-Null
+          powershell.exe -NoLogo -NoProfile -STA -ExecutionPolicy Bypass -File issuer/DinhDuoc-Key-Manager.ps1 -OwnerKeyPath "$env:RUNNER_TEMP/issuer-preview/test-private.dpapi" -PreviewPath "$pwd/dist/CONG-CU-CAP-MA-preview.png"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Package only the public tool files (no private signing keys)
+        shell: pwsh
+        run: |
+          $stage = 'package/DINH-DUOC-CONG-CU-CAP-MA'
+          New-Item -ItemType Directory -Path $stage -Force | Out-Null
+          @('Issuer.Core.ps1','DinhDuoc-Key-Manager.ps1','MO-CONG-CU-CAP-MA.cmd','HUONG-DAN-CAP-MA.txt','LICENSE') | ForEach-Object { Copy-Item "issuer/$_" "$stage/$_" }
+          $commandPath = Join-Path $stage 'MO-CONG-CU-CAP-MA.cmd'
+          $command = [IO.File]::ReadAllText($commandPath).Replace("`r`n","`n").Replace("`n","`r`n")
+          [IO.File]::WriteAllText($commandPath,$command,[Text.Encoding]::ASCII)
+          Compress-Archive -Path $stage -DestinationPath dist/DINH-DUOC-CONG-CU-CAP-MA.zip
+          $files = Get-ChildItem -File dist
+          $checks = $files | ForEach-Object { (Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLowerInvariant() + '  ' + $_.Name }
+          [IO.File]::WriteAllLines("$pwd/dist/SHA256SUMS.txt",$checks,[Text.Encoding]::ASCII)
+      - name: Attach owner tool to draft release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $files = Get-ChildItem -File dist | ForEach-Object FullName
+          gh release upload dinhduoc-voice-studio-owner-tools-v1 @files --repo $env:GITHUB_REPOSITORY --clobber
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: success() || failure()
+        with:
+          name: Dinh-Duoc-owner-tool
+          path: dist/*
+          if-no-files-found: warn

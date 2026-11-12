@@ -1,0 +1,15 @@
+import { readFileSync } from 'node:fs';
+import { join } from 'node:path';
+import { createHash, createPublicKey, verify } from 'node:crypto';
+import assert from 'node:assert/strict';
+const directory=process.argv[2];
+const authority=JSON.parse(readFileSync(join(directory,'test-public.json'),'utf8'));
+const token=readFileSync(join(directory,'test-license.txt'),'utf8');
+const [version,payload,signature]=token.split('.');
+assert.equal(version,'DDVS1');
+assert.equal(authority.keyId,createHash('sha256').update(`${authority.publicKey.n}.${authority.publicKey.e}`).digest('hex').slice(0,16));
+assert.equal(verify('RSA-SHA256',Buffer.from(`${version}.${payload}`),createPublicKey({key:authority.publicKey,format:'jwk'}),Buffer.from(signature,'base64url')),true);
+const claims=JSON.parse(Buffer.from(payload,'base64url').toString('utf8'));
+assert.equal(claims.machine,'A1B2-C3D4-E5F6-0718');
+assert.equal(claims.exp-claims.iat,30*86400);
+console.log('PowerShell issuer → Node verifier interoperability passed.');
