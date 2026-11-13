@@ -18,7 +18,9 @@ assert git('rev-parse','HEAD')==BASE_COMMIT
 run('git','apply',ROOT/'client/source.patch',cwd=SOURCE)
 authority=json.loads((SOURCE/'config/license-authority.json').read_text())
 assert authority['enabled'] is True and authority['authority']['keyId']=='cd5595bf4155492c'
-assert set(authority['authority']['publicKey'])=={'kty','n','e'}
+assert authority['additionalAuthorities'][0]['keyId']=='5c45b7efc2766d3e'
+for item in [authority['authority'], *authority['additionalAuthorities']]:
+ assert set(item['publicKey'])=={'kty','n','e'}
 bun=TOOLS/'node_modules/bun/bin/bun.exe'
 run(bun,'install','--frozen-lockfile',cwd=SOURCE)
 run(bun,'run','--cwd','electron','typecheck',cwd=SOURCE)

@@ -42,3 +42,10 @@ MÃ NGUỒN
 Bản tùy chỉnh từ VoiceStudio v0.5.8, AGPL-3.0. LICENSE và LICENSE-NOTICE.md
 được giữ trong app. SOURCE-DINH-DUOC.zip tại cùng trang phát hành chứa mã nguồn
 và kiểm tra tương ứng. Đây không phải bản phát hành chính thức của tác giả gốc.
+
+CẤP MÃ TỪ HAI MÁY
+Bản này nhận mã từ cả khóa máy ở nhà cd5595bf4155492c và máy công ty
+5c45b7efc2766d3e. Mỗi máy dùng công cụ cấp mã và khóa riêng đã tạo trên
+chính tài khoản Windows đó. Không tạo lại khóa, không gửi khóa riêng cho ai.
+Mã cũ của máy ở nhà vẫn hợp lệ. Bạn bè cần dùng bản app mới này để nhận
+mã do máy công ty cấp; bản app cũ chỉ biết khóa máy ở nhà.

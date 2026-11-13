@@ -306,10 +306,10 @@ index 6475314..fd13dc1 100644
  }
 diff --git a/config/license-authority.json b/config/license-authority.json
 new file mode 100644
-index 0000000..72b0b88
+index 0000000..f03fce1
 --- /dev/null
 +++ b/config/license-authority.json
-@@ -0,0 +1,14 @@
+@@ -0,0 +1,27 @@
 +{
 +  "enabled": true,
 +  "authority": {
@@ -322,7 +322,20 @@ index 0000000..72b0b88
 +      "n": "n1dy1iXBrxe5DcSttGLpktw94OmT3w5IM2s9J-xVD4CZnSHNp33SNHJuMmYgpRjvlB4KixYYP64i7JP4ao9RERC0e_yW6L8Tj6gtxBufDBbTHk-_KurCO8IWP3yU1adTfPbvwVkEpKV4VZVYkjr7dPBDcLRpYiHg6aXRzF9gX6ogXnjU2pcvBZEFiUnLYSNzWTYKsxa911Jaz8HF_JFJ6rwCbY0iktL4d2P1DEcEcTFpfaLrLaIwJaqWY6gZsJcPN13Vsi_zYL0M8TRLKa7A9IG7AtsMUl1MFCG3R5SufaQGP2CZ0Vaw2J811j4AKuGD26woxSjcI-yfRMwaBgTo--LfcevdrTh5USkCqMbAziMjggawkoR6YtHeEhagfi5ZNrG5hwN3ps6XAPmrI6DIOcu2SzCC822njLDzVU-56E-KWW_dD6eMhArq8Hr5CMrtjhx4cWGKk89PcePtuFbnqeIjKnpYhqrrgMGosBSshz2cxJ9xvAq8maegPIzumZHF",
 +      "e": "AQAB"
 +    }
-+  }
++  },
++  "additionalAuthorities": [
++    {
++      "schema": 1,
++      "product": "vn.dinhduoc.voicestudio",
++      "algorithm": "RS256",
++      "keyId": "5c45b7efc2766d3e",
++      "publicKey": {
++        "kty": "RSA",
++        "n": "1PbG2DeukW2MNfgFMFc-WAMS68ZH3rmypQHP9foy_QmPstHS-sgUf7YF14QhYJOebLGtTEa9Lt9AcNJ-sdgfy0v20jedrRf3rBfbNt8cQ3TfOccicnO3Gr9-YCWxQ4S_jgrIZTKSd3rGQTneDUdM6VAHfowa8Kitk_gKkXHdISnROcLXEWYsWMMvkuR-_GNA8XOr79JEH-kvuwZy4BbrQ8JYppeW2frGcm-_mLt-Gy4tVpoMPO7-AxkvfUgAJohvH7kD57mWY38ijncVfBBCLqSdGd_TYTbmkGocAMHJB_g03pP0vPB_pQ5uWsT4IuaOZ3Z2SUe2dkF0mPBecrN-BESqaGme5EAgbPEEy5s08ws5zjli_O8R7NRG8U-oR72RElzgiUgUh7XMAsbs7r92hZ3dTptUsGFqfCDWpF3tfwGyoWHezLgEtIzIjVFxMYsQ6NjexxwNpF1_gHYFsvY9cuch00uGo36o8CE5uNA8KB_SNt2nu3jV2fRzJj9mAy4t",
++        "e": "AQAB"
++      }
++    }
++  ]
 +}
 diff --git a/docs/dinhduoc-activation.md b/docs/dinhduoc-activation.md
 new file mode 100644
@@ -643,7 +656,7 @@ index 0000000..4f7d347
 +});
 diff --git a/electron/src/main/device-activation.ts b/electron/src/main/device-activation.ts
 new file mode 100644
-index 0000000..5243f9d
+index 0000000..159ccec
 --- /dev/null
 +++ b/electron/src/main/device-activation.ts
 @@ -0,0 +1,206 @@
@@ -714,7 +727,7 @@ index 0000000..5243f9d
 +  onLocked: () => void,
 +): Promise<ActivationLease | null> {
 +  if (!licenseConfig.enabled) return noopLease;
-+  const authority = licenseConfig.authority as LicenseAuthority;
++  const authority: LicenseAuthority[] = [licenseConfig.authority, ...licenseConfig.additionalAuthorities] as LicenseAuthority[];
 +  const machine = currentMachineCode();
 +  const path = join(app.getPath('userData'), 'device-activation.dat');
 +  let state: State = { token: '', lastSeen: 0 };
@@ -855,10 +868,10 @@ index 0000000..5243f9d
 +}
 diff --git a/electron/src/main/device-license.test.ts b/electron/src/main/device-license.test.ts
 new file mode 100644
-index 0000000..3044679
+index 0000000..59ddb80
 --- /dev/null
 +++ b/electron/src/main/device-license.test.ts
-@@ -0,0 +1,118 @@
+@@ -0,0 +1,146 @@
 +import { createHash, generateKeyPairSync, sign } from 'node:crypto';
 +import { describe, expect, it } from 'vitest';
 +import {
@@ -977,12 +990,40 @@ index 0000000..3044679
 +    );
 +  });
 +});
++
++describe('multiple authorized issuing computers', () => {
++  const second = generateKeyPairSync('rsa', { modulusLength: 3072 });
++  const secondJwk = second.publicKey.export({ format: 'jwk' });
++  const company: LicenseAuthority = { ...authority, publicKey: { kty: 'RSA', n: secondJwk.n!, e: secondJwk.e! }, keyId: '' };
++  company.keyId = authorityKeyId(company);
++  function companyIssue(overrides: Record<string, unknown> = {}) {
++    const claims = JSON.parse(Buffer.from(issue().split('.')[1], 'base64url').toString());
++    const payload = Buffer.from(JSON.stringify({ ...claims, kid: company.keyId, ...overrides })).toString('base64url');
++    const message = `DDVS1.${payload}`;
++    return `${message}.${sign('RSA-SHA256', Buffer.from(message), second.privateKey).toString('base64url')}`;
++  }
++  it('accepts both home and company signatures and preserves existing home codes', () => {
++    for (const token of [issue(), companyIssue()]) {
++      expect(checkDeviceLicense(token, machine, [authority, company], now).valid).toBe(true);
++    }
++    expect(checkDeviceLicense(companyIssue(), machine, authority, now).valid).toBe(false);
++  });
++  it('keeps machine and expiry restrictions for the second issuer', () => {
++    expect(checkDeviceLicense(companyIssue(), machineCode('other'), [authority, company], now)).toEqual({valid:false,reason:'wrong_machine'});
++    expect(checkDeviceLicense(companyIssue({exp:now+1}), machine, [authority, company], now+1)).toEqual({valid:false,reason:'expired'});
++  });
++  it('rejects unknown issuers, altered signatures and an empty trust list', () => {
++    expect(checkDeviceLicense(issue(), machine, [company], now).valid).toBe(false);
++    expect(checkDeviceLicense(companyIssue()+'x', machine, [authority, company], now).valid).toBe(false);
++    expect(checkDeviceLicense(issue(), machine, [], now).valid).toBe(false);
++  });
++});
 diff --git a/electron/src/main/device-license.ts b/electron/src/main/device-license.ts
 new file mode 100644
-index 0000000..81646cf
+index 0000000..af7aae0
 --- /dev/null
 +++ b/electron/src/main/device-license.ts
-@@ -0,0 +1,100 @@
+@@ -0,0 +1,122 @@
 +import { createHash, createPublicKey, verify } from 'node:crypto';
 +
 +export const LICENSE_PRODUCT = 'vn.dinhduoc.voicestudio';
@@ -1027,9 +1068,28 @@ index 0000000..81646cf
 +export function checkDeviceLicense(
 +  token: string,
 +  machine: string,
-+  authority: LicenseAuthority,
++  authority: LicenseAuthority | readonly LicenseAuthority[],
 +  nowSeconds = Math.floor(Date.now() / 1000),
 +  lastSeenSeconds = 0,
++): LicenseVerdict {
++  if (Array.isArray(authority)) {
++    let failure: LicenseVerdict = { valid: false, reason: 'invalid' };
++    for (const candidate of authority) {
++      const result = checkDeviceLicense(token, machine, candidate, nowSeconds, lastSeenSeconds);
++      if (result.valid) return result;
++      if (result.reason === 'wrong_machine' || result.reason === 'expired' || result.reason === 'clock') failure = result;
++    }
++    return failure;
++  }
++  return checkSingleAuthority(token, machine, authority as LicenseAuthority, nowSeconds, lastSeenSeconds);
++}
++
++function checkSingleAuthority(
++  token: string,
++  machine: string,
++  authority: LicenseAuthority,
++  nowSeconds: number,
++  lastSeenSeconds: number,
 +): LicenseVerdict {
 +  try {
 +    if (
@@ -1050,12 +1110,15 @@ index 0000000..81646cf
 +    if (value.length > 8192) return { valid: false, reason: 'invalid' };
 +    const parts = /^DDVS1\.([A-Za-z0-9_-]+)\.([A-Za-z0-9_-]+)$/.exec(value);
 +    if (!parts) return { valid: false, reason: 'invalid' };
++    const signature = Buffer.from(parts[2], 'base64url');
++    if (signature.length !== Math.ceil((key.asymmetricKeyDetails?.modulusLength ?? 0) / 8) || signature.toString('base64url') !== parts[2])
++      return { valid: false, reason: 'invalid' };
 +    if (
 +      !verify(
 +        'RSA-SHA256',
 +        Buffer.from(`DDVS1.${parts[1]}`, 'utf8'),
 +        key,
-+        Buffer.from(parts[2], 'base64url'),
++        signature,
 +      )
 +    )
 +      return { valid: false, reason: 'invalid' };
