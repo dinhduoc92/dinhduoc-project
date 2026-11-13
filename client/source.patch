@@ -1,7 +1,16 @@
 diff --git a/backend/api/routers/generation.py b/backend/api/routers/generation.py
-index 0fd22e7..9b1eb7a 100644
+index 0fd22e7..6a7edf0 100644
 --- a/backend/api/routers/generation.py
 +++ b/backend/api/routers/generation.py
+@@ -16,7 +16,7 @@ import threading
+ import traceback
+ from pathlib import Path
+ from typing import Optional, Literal
+-from fastapi import APIRouter, File, Form, UploadFile, HTTPException, Depends
++from fastapi import APIRouter, File, Form, UploadFile, HTTPException, Depends, Request
+ from fastapi.responses import JSONResponse, Response, StreamingResponse
+ from pydantic import BaseModel
+ 
 @@ -1661,7 +1661,7 @@ async def _finalize_generation(
      audio_tensor, sample_rate, *, text, history_mode, ref_audio_path,
      language, instruct, resolved_profile_id, used_seed, start_time,
@@ -54,7 +63,55 @@ index 0fd22e7..9b1eb7a 100644
          raise
  
      audio_dur = round(audio_tensor.shape[-1] / sample_rate, 2)
-@@ -1936,6 +1950,8 @@ async def generate_speech(
+@@ -1883,8 +1897,47 @@ def _parse_emotion_vector(raw: Optional[str]) -> Optional[list[float]]:
+     return [float(item) for item in value]
+ 
+ 
++@router.post("/generation-control/{control_id}/{action}")
++def update_generation_control(control_id: str, action: str):
++    from services import generation_control as control
++    try:
++        if action == "start":
++            state = control.start(control_id)
++        elif action == "cancel":
++            control.validate_id(control_id)
++            control.cancel(control_id)
++            return {"state": "cancelled"}
++        elif action in {"pause", "resume"}:
++            state = control.get(control_id)
++            state.requested = action == "pause"
++            state.phase = "pausing" if state.requested and state.phase != "paused" else ("paused" if state.requested else "running")
++        else:
++            raise ValueError("Unknown generation control action")
++        state.touch()
++        return state.status()
++    except ValueError as error:
++        raise HTTPException(status_code=422, detail=str(error))
++    except KeyError:
++        raise HTTPException(status_code=404, detail="Generation control no longer exists")
++
++
++@router.get("/generation-control/{control_id}", dependencies=[Depends(reject_cross_site_get)])
++def generation_control_status(control_id: str):
++    from services.generation_control import get
++    try:
++        state = get(control_id)
++        state.touch()
++        return state.status()
++    except ValueError as error:
++        raise HTTPException(status_code=422, detail=str(error))
++    except KeyError:
++        raise HTTPException(status_code=404, detail="Generation control no longer exists")
++
++
+ @router.post("/generate")
+ async def generate_speech(
++    request: Request,
++    generation_control_id: Optional[str] = Form(None),
+     text: str = Form(...),
+     language: Optional[str] = Form(None),
+     ref_audio: Optional[UploadFile] = File(None),
+@@ -1936,6 +1989,8 @@ async def generate_speech(
      # classic flow, so streaming is purely a delivery channel — engine-agnostic
      # (text-level chunking, no per-engine token streaming).
      stream: bool = Form(False),
@@ -63,7 +120,7 @@ index 0fd22e7..9b1eb7a 100644
  ):
      """Generate a voice take through the selected TTS engine.
  
-@@ -1951,6 +1967,20 @@ async def generate_speech(
+@@ -1951,6 +2006,22 @@ async def generate_speech(
      # (utils/duration.py) so the estimate and the synthesis see the same text.
      import unicodedata
      text = unicodedata.normalize("NFC", text)
@@ -78,13 +135,15 @@ index 0fd22e7..9b1eb7a 100644
 +        raise HTTPException(status_code=422, detail="Each script line must contain spoken words, not only expression tags.")
 +    if subtitle_lines and (not caption_lines or duration is not None):
 +        raise HTTPException(status_code=422, detail="Line subtitles need non-empty text and automatic duration.")
++    if generation_control_id and not subtitle_lines:
++        raise HTTPException(status_code=422, detail="Pause controls require line subtitle mode.")
 +    # Line mode returns a canonical WAV plus its sidecar, never an NDJSON preview.
 +    if subtitle_lines:
 +        stream = False
  
      # ── Engine resolution (issue #312) ──────────────────────────────────────
      # The request runs on the engine selected in Settings (POST /engines/select,
-@@ -2346,7 +2376,9 @@ async def generate_speech(
+@@ -2346,7 +2417,9 @@ async def generate_speech(
      # in services/text_normalization.py). Pref-gated (default ON), idempotent,
      # never raises; applied exactly once per request, at this choke point.
      from services.text_normalization import normalize_for_tts
@@ -95,7 +154,7 @@ index 0fd22e7..9b1eb7a 100644
  
      # Expressive-TTS Spec 01: apply the user pronunciation dictionary + inline
      # [[…]] one-off overrides to the text, here — AFTER `language` is fully
-@@ -2363,15 +2395,18 @@ async def generate_speech(
+@@ -2363,15 +2436,18 @@ async def generate_speech(
              _pron_rows = load_entries_from_db()
          except Exception:  # noqa: BLE001 — table missing / DB locked → no-op
              _pron_rows = []
@@ -117,7 +176,15 @@ index 0fd22e7..9b1eb7a 100644
  
      start_time = time.time()
  
-@@ -2765,24 +2800,49 @@ async def generate_speech(
+@@ -2737,6 +2813,7 @@ async def generate_speech(
+     # so. A warning in a log the user never opens is a record of the bug, not a
+     # fix for it.
+     _dropped_text: list = []
++    batch_control = None
+     try:
+         # The gateway owns the dispatch on both branches. Locally it still
+         # lands in run_on_gpu_pool_guarded, so the #730 bound + pool reset
+@@ -2765,24 +2842,62 @@ async def generate_speech(
                  class_temperature, used_seed, effect_preset,
                  max_chunk_chars, crossfade_ms, dropped_sink=_dropped_text,
              )
@@ -157,6 +224,17 @@ index 0fd22e7..9b1eb7a 100644
 +        line_clock = LineClock(caption_lines) if subtitle_lines else None
 +        if line_clock is not None:
 +            import torch
++            if generation_control_id:
++                from services.generation_control import get
++                try:
++                    candidate_control = get(generation_control_id)
++                except (ValueError, KeyError):
++                    raise HTTPException(status_code=409, detail="Generation control expired. Restart the batch.")
++                if candidate_control.claimed:
++                    raise HTTPException(status_code=409, detail="Generation control is already in use.")
++                batch_control = candidate_control
++                batch_control.claimed = True
++                await batch_control.checkpoint(request.is_disconnected)
 +            parts = []
 +            for line_index, line in enumerate(render_lines):
 +                if not line.strip():
@@ -175,13 +253,15 @@ index 0fd22e7..9b1eb7a 100644
 +                if pause_frames:
 +                    parts.append(part_cpu.new_zeros((*part_cpu.shape[:-1], pause_frames)))
 +                parts.append(part_cpu)
++                if batch_control:
++                    await batch_control.checkpoint(request.is_disconnected)
 +            audio_tensor = torch.cat(parts, dim=-1)
 +        else:
 +            audio_tensor = await render_one(_local_render)
          # Read after generation: engines with lazy model loading report
          # their real rate only once weights are up.
          sample_rate = (_backend.sample_rate if _backend is not None
-@@ -2795,6 +2855,8 @@ async def generate_speech(
+@@ -2795,6 +2910,8 @@ async def generate_speech(
              resolved_profile_id=resolved_profile_id, used_seed=used_seed,
              start_time=start_time, already_marked=False, wav_bits=int(wav_bits), include_wav_bytes=True,
              design_recipe=stored_design_recipe, engine_id=engine_id,
@@ -190,7 +270,7 @@ index 0fd22e7..9b1eb7a 100644
          )
          audio_id = _meta["id"]
          audio_filename = _meta["filename"]
-@@ -2817,6 +2879,8 @@ async def generate_speech(
+@@ -2817,6 +2934,8 @@ async def generate_speech(
              "X-Audio-Duration": str(audio_dur),
              "Content-Length": str(len(wav_bytes)),
          }
@@ -199,7 +279,16 @@ index 0fd22e7..9b1eb7a 100644
          # #1330: the body is a WAV, so the header channel carries the notice
          # that some of the text produced no audio. Count first (always exact),
          # then as much of the lost text as a header can safely hold.
-@@ -2914,6 +2978,8 @@ def _remove_deferred_wavs(paths) -> None:
+@@ -2889,6 +3008,8 @@ async def generate_speech(
+             ),
+         )
+     finally:
++        if batch_control is not None:
++            batch_control.claimed = False
+         if cleanup_ref and ref_lease is not None:
+             ref_lease.finish_request()
+ 
+@@ -2914,6 +3035,8 @@ def _remove_deferred_wavs(paths) -> None:
      for p in paths:
          with contextlib.suppress(OSError):
              os.remove(p)
@@ -208,7 +297,7 @@ index 0fd22e7..9b1eb7a 100644
  
  
  def _remove_wav_if_unreferenced(conn, audio_path, exclude_ids=(), defer=None):
-@@ -2945,6 +3011,8 @@ def _remove_wav_if_unreferenced(conn, audio_path, exclude_ids=(), defer=None):
+@@ -2945,6 +3068,8 @@ def _remove_wav_if_unreferenced(conn, audio_path, exclude_ids=(), defer=None):
          return
      with contextlib.suppress(OSError):
          os.remove(p)
@@ -217,7 +306,7 @@ index 0fd22e7..9b1eb7a 100644
  
  
  # How many takes to keep before pruning the oldest UNstarred ones (rows + their
-@@ -3042,6 +3110,8 @@ def list_history():
+@@ -3042,6 +3167,8 @@ def list_history():
                  # What "save as voice" may use as the take's transcript; ""
                  # asks for the take's audio to be transcribed (#3062).
                  item["transcript"] = take_reference_transcript(item.get("text"))
@@ -238,6 +327,80 @@ index 6141de4..50cff4c 100644
      "X-Audio-Duration",
      "X-Gen-Time",
      "X-Seed",
+diff --git a/backend/services/generation_control.py b/backend/services/generation_control.py
+new file mode 100644
+index 0000000..180a724
+--- /dev/null
++++ b/backend/services/generation_control.py
+@@ -0,0 +1,68 @@
++"""In-memory, leased controls for one desktop line-synthesis batch."""
++import asyncio
++import re
++import time
++from dataclasses import dataclass, field
++
++
++@dataclass
++class BatchControl:
++    requested: bool = False
++    cancelled: bool = False
++    phase: str = 'running'
++    touched: float = field(default_factory=time.monotonic)
++    claimed: bool = False
++
++    def touch(self):
++        self.touched = time.monotonic()
++
++    def status(self):
++        if self.requested and not self.claimed:
++            self.phase = 'paused'
++        return {'state': self.phase, 'pause_requested': self.requested}
++
++    async def checkpoint(self, disconnected):
++        while True:
++            if self.cancelled or await disconnected():
++                raise asyncio.CancelledError('Batch stopped or its client disconnected')
++            if not self.requested:
++                self.phase = 'running'
++                return
++            self.phase = 'paused'
++            await asyncio.sleep(0.1)
++
++
++controls = {}
++
++
++def validate_id(key):
++    if not re.fullmatch(r'[a-f0-9]{32}', key):
++        raise ValueError('Invalid generation control ID')
++
++
++def start(key):
++    validate_id(key)
++    for old, state in list(controls.items()):
++        if state.cancelled or (not state.claimed and time.monotonic() - state.touched > 300):
++            state.cancelled = True
++            controls.pop(old, None)
++    if key in controls:
++        raise ValueError('Generation control already exists')
++    if len(controls) >= 32:
++        raise ValueError('Too many active generation controls')
++    controls[key] = BatchControl()
++    return controls[key]
++
++
++def get(key):
++    validate_id(key)
++    state = controls.get(key)
++    if state is None or state.cancelled or (not state.claimed and time.monotonic() - state.touched > 300):
++        raise KeyError('Generation control no longer exists')
++    return state
++
++
++def cancel(key):
++    state = controls.pop(key, None)
++    if state is not None:
++        state.cancelled = True
 diff --git a/backend/services/line_subtitles.py b/backend/services/line_subtitles.py
 new file mode 100644
 index 0000000..c6f924c
@@ -415,10 +578,10 @@ index 0000000..f03fce1
 +}
 diff --git a/docs/dinhduoc-activation.md b/docs/dinhduoc-activation.md
 new file mode 100644
-index 0000000..9385b61
+index 0000000..2a72927
 --- /dev/null
 +++ b/docs/dinhduoc-activation.md
-@@ -0,0 +1,21 @@
+@@ -0,0 +1,38 @@
 +# ĐÌNH ĐƯỢC- VOICE STUDIO custom Windows build
 +
 +The fixed RSA public key in `config/license-authority.json` verifies machine-bound
@@ -440,6 +603,23 @@ index 0000000..9385b61
 +added. A following SRT cue starts after that same silence in the waveform. Existing
 +recordings must be regenerated to apply the new pause. Normal whole-paragraph
 +synthesis and voice design retain their existing behavior.
++
++## Pause and resume a TXT batch
++
++The clone composer offers Pause and Resume while Audio + SRT line mode is running,
++including multiple imported TXT files. Pause waits for the current sentence to
++finish, then stops at the next sentence boundary. The status distinguishes a
++pending pause from an acknowledged pause. Resume retains in-memory sentence audio
++and continues without re-synthesizing completed sentences or completed TXT files.
++The SRT clock counts audio samples and configured inter-sentence silence only;
++time spent waiting at a manual pause never changes caption timestamps.
++
++Controls are local, in-memory and apply only while the app remains open. Closing
++the app or cancelling discards incomplete-file progress. Already exported files
++remain on disk. The cancel button remains available while paused. A disconnected
++request is cancelled at a sentence boundary; inactive controls are cleaned up.
++Controlled requests keep the backend's per-sentence inference limits, but omit
++the frontend's wall-clock backstop so a deliberate pause does not time out.
 diff --git a/docs/electron-longform.md b/docs/electron-longform.md
 index c4cfbff..d618fbb 100644
 --- a/docs/electron-longform.md
@@ -1223,7 +1403,7 @@ index 0000000..af7aae0
 +  }
 +}
 diff --git a/electron/src/main/index.ts b/electron/src/main/index.ts
-index 647381d..3782006 100644
+index 647381d..17fb847 100644
 --- a/electron/src/main/index.ts
 +++ b/electron/src/main/index.ts
 @@ -1,4 +1,6 @@
@@ -1245,7 +1425,16 @@ index 647381d..3782006 100644
  registerAppScheme();
  
  const mainErrors = new MainErrorJournal(
-@@ -429,6 +436,14 @@ if (singleInstance && !app.requestSingleInstanceLock()) {
+@@ -274,6 +281,8 @@ function createWindow(): BrowserWindow {
+       : { titleBarOverlay: OVERLAY }),
+     webPreferences: {
+       preload: PRELOAD_PATH,
++      // Keep the batch control heartbeat and pause/resume responsive when minimized.
++      backgroundThrottling: false,
+       contextIsolation: true,
+       // ESM preload scripts (electron-vite emits .mjs) require an unsandboxed renderer.
+       sandbox: false,
+@@ -429,6 +438,14 @@ if (singleInstance && !app.requestSingleInstanceLock()) {
      .whenReady()
      .then(async () => {
        electronApp.setAppUserModelId(APP_ID);
@@ -1260,7 +1449,7 @@ index 647381d..3782006 100644
        if (app.isPackaged) {
          try {
            setUpTerminalCommand(
-@@ -458,6 +473,7 @@ if (singleInstance && !app.requestSingleInstanceLock()) {
+@@ -458,6 +475,7 @@ if (singleInstance && !app.requestSingleInstanceLock()) {
          console.log(`[supervisor] stage=${s.stage} managed=${s.managed} port=${s.port}${detail}`);
          publishDiscovery();
        });
@@ -1268,7 +1457,7 @@ index 647381d..3782006 100644
        installAppProtocol(
          () => backend.baseUrl,
          RENDERER_DIR,
-@@ -515,11 +531,14 @@ if (singleInstance && !app.requestSingleInstanceLock()) {
+@@ -515,11 +533,14 @@ if (singleInstance && !app.requestSingleInstanceLock()) {
        );
        // 10 s after launch, then every 6 h; a failed check retries after 1 h,
        // doubling back to 6 h.
@@ -1288,7 +1477,7 @@ index 647381d..3782006 100644
        checkForUpdates = () =>
          observeMainProcessTask(updater.check(false), mainErrors, 'Terminal update check');
        closeUpdates = () => {
-@@ -530,6 +549,7 @@ if (singleInstance && !app.requestSingleInstanceLock()) {
+@@ -530,6 +551,7 @@ if (singleInstance && !app.requestSingleInstanceLock()) {
          closeUpdateIpc();
        };
        if (!headlessOwner) mainWindow = createWindow();
@@ -2099,8 +2288,64 @@ index 08b4054..1c5c7ee 100644
      </Button>
    );
    if (!mp3Url) return button;
+diff --git a/electron/src/renderer/src/features/clone/action-bar.test.tsx b/electron/src/renderer/src/features/clone/action-bar.test.tsx
+index 9153f1f..0b3ceae 100644
+--- a/electron/src/renderer/src/features/clone/action-bar.test.tsx
++++ b/electron/src/renderer/src/features/clone/action-bar.test.tsx
+@@ -26,10 +26,14 @@ vi.mock('@/hooks/use-tts-languages', () => ({
+ }));
+ const generate = vi.fn(() => Promise.resolve());
+ const cancel = vi.fn();
++const pause = vi.fn();
++const resume = vi.fn();
+ const setCloneSetting = vi.fn();
+ const resetVoiceControls = vi.fn();
+ const runtime = {
+   isGenerating: false,
++  canPause: false,
++  pauseState: 'running',
+   elapsedSeconds: 0,
+   progress: null as number | null,
+   stage: 'preparing',
+@@ -80,6 +84,8 @@ vi.mock('@/hooks/use-generate', () => ({
+   useGenerateClone: () => ({
+     generate,
+     cancel,
++    pause,
++    resume,
+     error: failure.error,
+     errorTopic: failure.topic,
+     cloneBlocker: readiness.blocker,
+@@ -88,6 +94,18 @@ vi.mock('@/hooks/use-generate', () => ({
+ }));
+ 
+ describe('ActionBar', () => {
++  it.each(['running','pausing','paused'])('shows batch controls for %s and keeps cancellation available', (state) => {
++    Object.assign(runtime,{isGenerating:true,canPause:true,pauseState:state});
++    render(<ActionBar />);
++    const pauseButton=screen.getByRole('button',{name:'Pause'});
++    const resumeButton=screen.getByRole('button',{name:'Resume'});
++    if(state==='running') {
++      expect(resumeButton).toBeDisabled();fireEvent.click(pauseButton);expect(pause).toHaveBeenCalled();
++    } else {
++      expect(pauseButton).toBeDisabled();fireEvent.click(resumeButton);expect(resume).toHaveBeenCalled();
++    }
++    expect(screen.getByRole('button',{name:'Cancel generation'})).toBeEnabled();
++  });
+   beforeEach(() => {
+     readiness.blocker = null;
+     failure.error = null;
+@@ -97,6 +115,8 @@ describe('ActionBar', () => {
+   beforeEach(() => {
+     Object.assign(runtime, {
+       isGenerating: false,
++      canPause: false,
++      pauseState: 'running',
+       elapsedSeconds: 0,
+       progress: null,
+       stage: 'preparing',
 diff --git a/electron/src/renderer/src/features/clone/action-bar.tsx b/electron/src/renderer/src/features/clone/action-bar.tsx
-index addf7bf..0691df4 100644
+index addf7bf..7bccb51 100644
 --- a/electron/src/renderer/src/features/clone/action-bar.tsx
 +++ b/electron/src/renderer/src/features/clone/action-bar.tsx
 @@ -209,6 +209,7 @@ function Overrides({ settings }: OverridesProps) {
@@ -2111,15 +2356,20 @@ index addf7bf..0691df4 100644
                onChange={(event) => setCloneSetting('duration', event.target.value)}
                placeholder={t('clone.auto')}
                className="h-7 text-xs tabular-nums"
-@@ -326,6 +327,7 @@ export function ActionBar({ setup: shared }: { setup?: EngineSetup } = {}) {
+@@ -325,7 +326,12 @@ export function ActionBar({ setup: shared }: { setup?: EngineSetup } = {}) {
+   const {
      generate,
      cancel,
++    pause,
++    resume,
++    canPause,
++    pauseState,
      isGenerating,
 +    batchProgress,
      elapsedSeconds,
      progress,
      stage,
-@@ -374,6 +376,11 @@ export function ActionBar({ setup: shared }: { setup?: EngineSetup } = {}) {
+@@ -374,6 +380,11 @@ export function ActionBar({ setup: shared }: { setup?: EngineSetup } = {}) {
          />
        )}
        {!demo && !isGenerating && <ExpressionTip />}
@@ -2131,6 +2381,20 @@ index addf7bf..0691df4 100644
        <div className="flex flex-wrap items-center gap-3">
          <div className="flex items-center gap-1 rounded-lg bg-background/50 p-1 ring-1 ring-border/50">
            <EngineLanguagePicker />
+@@ -432,6 +443,13 @@ export function ActionBar({ setup: shared }: { setup?: EngineSetup } = {}) {
+               )}
+             </Button>
+           )}
++          {isGenerating && canPause && !demo ? (
++            <div className="flex shrink-0 items-center gap-1">
++              <Button variant="outline" disabled={pauseState !== 'running'} onClick={() => void pause()}>{t('common.pause')}</Button>
++              <Button variant="outline" disabled={pauseState === 'running'} onClick={() => void resume()}>{t('common.resume')}</Button>
++              {pauseState !== 'running' && <span role="status" className="max-w-44 text-xs text-muted-foreground">{t(pauseState === 'paused' ? 'common.paused' : 'clone.pausing_after_sentence')}</span>}
++            </div>
++          ) : null}
+           {isGenerating && !demo ? (
+             <Button
+               size="icon-lg"
 diff --git a/electron/src/renderer/src/features/clone/output-panel.tsx b/electron/src/renderer/src/features/clone/output-panel.tsx
 index 87a85b8..3529f3a 100644
 --- a/electron/src/renderer/src/features/clone/output-panel.tsx
@@ -2327,7 +2591,7 @@ index 12fdf96..f75044a 100644
            />
          )}
 diff --git a/electron/src/renderer/src/hooks/use-generate.test.tsx b/electron/src/renderer/src/hooks/use-generate.test.tsx
-index 8154371..7a1a1b2 100644
+index 8154371..90d478a 100644
 --- a/electron/src/renderer/src/hooks/use-generate.test.tsx
 +++ b/electron/src/renderer/src/hooks/use-generate.test.tsx
 @@ -8,6 +8,23 @@ import { generateClone } from '@/lib/api/generate';
@@ -2482,7 +2746,7 @@ index 8154371..7a1a1b2 100644
        await waitFor(() => expect(screen.queryByRole('dialog')).not.toBeInTheDocument());
        expect(screen.queryByRole('alert')).not.toBeInTheDocument();
        expect(generateClone).toHaveBeenCalledOnce();
-@@ -773,54 +822,179 @@ it.each([['clone', false], ['design', false], ['clone', true], ['design', true]]
+@@ -773,54 +822,215 @@ it.each([['clone', false], ['design', false], ['clone', true], ['design', true]]
  it.each([
    ['records a warm take', { status: 'ready', loading: false }, 1],
    ['skips a take that waited for model loading', { status: 'loading', loading: true }, 0],
@@ -2628,6 +2892,42 @@ index 8154371..7a1a1b2 100644
 +        </GenerationProvider>
 +      </QueryClientProvider>,
 +    );
++  it('pauses between TXT files without re-rendering completed work and cleans up controls', async () => {
++    const {apiJson}=await import('@/lib/api/client');
++    let requested=false;
++    vi.mocked(apiJson).mockImplementation(async (path) => {
++      if(path.endsWith('/pause')) requested=true;
++      if(path.endsWith('/resume')) requested=false;
++      if(path.startsWith('/generation-control/')) return {state:requested?'paused':'running',pause_requested:requested};
++      return modelStatus.value;
+     });
++    const result={blob:new Blob(),id:'pause-test',audioPath:'pause.wav',subtitlePath:'pause.srt',durationSeconds:1,genTimeSeconds:1,seed:1,routing:null,dropped:null};
++    let finishFirst!: (value:typeof result)=>void;
++    vi.mocked(generateClone).mockImplementationOnce(()=>new Promise(resolve=>{finishFirst=resolve;})).mockResolvedValue(result);
++    function Controls() {
++      const state=useGenerateClone();
++      return <><button onClick={()=>void state.generate()}>start-pause-test</button><button disabled={!state.canPause} onClick={()=>void state.pause()}>pause-test</button><button onClick={()=>void state.resume()}>resume-test</button><span data-testid="pause-state">{state.pauseState}</span></>;
++    }
++    try {
++      render(<QueryClientProvider client={new QueryClient()}><GenerationProvider><Controls /></GenerationProvider></QueryClientProvider>);
++      fireEvent.click(screen.getByText('start-pause-test'));
++      await waitFor(()=>expect(generateClone).toHaveBeenCalledTimes(1));
++      fireEvent.click(screen.getByText('pause-test'));
++      await waitFor(()=>expect(requested).toBe(true));
++      await act(async()=>{finishFirst(result);});
++      await waitFor(()=>expect(batchNative.save).toHaveBeenCalledTimes(1));
++      expect(generateClone).toHaveBeenCalledTimes(1);
++      fireEvent.click(screen.getByText('resume-test'));
++      await waitFor(()=>expect(batchNative.end).toHaveBeenCalled());
++      expect(generateClone).toHaveBeenCalledTimes(3);
++      const ids=vi.mocked(generateClone).mock.calls.map(([input])=>input.generationControlId);
++      expect(ids[0]).toMatch(/^[a-f0-9]{32}$/);expect(new Set(ids).size).toBe(1);
++      expect(vi.mocked(apiJson).mock.calls.some(([path])=>path.endsWith('/cancel'))).toBe(true);
++    } finally {
++      vi.mocked(apiJson).mockImplementation(()=>Promise.resolve(modelStatus.value));
++      setCloneScripts([]);
++    }
++  });
 +  it('renders and saves every TXT sequentially using one chosen directory', async () => {
 +    const order: string[] = [];
 +    vi.mocked(generateClone).mockImplementation(async (input) => {
@@ -2643,7 +2943,7 @@ index 8154371..7a1a1b2 100644
 +        routing: null,
 +        dropped: null,
 +      };
-     });
++    });
 +    batchNative.save.mockImplementation(async (req) => {
 +      order.push('save:' + req.suggestedName);
 +      return { canceled: false, path: req.suggestedName };
@@ -2709,7 +3009,7 @@ index 8154371..7a1a1b2 100644
 +  });
  });
 diff --git a/electron/src/renderer/src/hooks/use-generate.ts b/electron/src/renderer/src/hooks/use-generate.ts
-index a1a9f04..f44f24f 100644
+index a1a9f04..0bf235f 100644
 --- a/electron/src/renderer/src/hooks/use-generate.ts
 +++ b/electron/src/renderer/src/hooks/use-generate.ts
 @@ -42,6 +42,10 @@ import { recordActionBreadcrumb } from '@/lib/report-breadcrumb';
@@ -2723,23 +3023,33 @@ index a1a9f04..f44f24f 100644
  
  const TIMER_TICK_MS = 100;
  const PROGRESS_THROTTLE_MS = 100;
-@@ -89,6 +93,7 @@ export interface UseGenerateClone {
+@@ -88,7 +92,12 @@ export interface UseGenerateClone {
+   generateDesign(input: DesignGenerateInput): Promise<void>;
    generate(): Promise<void>;
    cancel(): void;
++  pause(): Promise<void>;
++  resume(): Promise<void>;
++  canPause: boolean;
++  pauseState: 'running' | 'pausing' | 'paused';
    isGenerating: boolean;
 +  batchProgress?: { index: number; total: number; sourceName: string } | null;
    elapsedSeconds: number;
    /** 0..100 while the WAV body streams in; null when unknown. */
    progress: number | null;
-@@ -200,6 +205,7 @@ function useGenerateController(): UseGenerateClone {
+@@ -199,7 +208,12 @@ function useGenerateController(): UseGenerateClone {
+     setErrorCause(null);
    }, []);
    useResolvedLicenceError(errorCause, clearError);
++  const [canPause, setCanPause] = useState(false);
++  const [pauseState, setPauseState] = useState<'running' | 'pausing' | 'paused'>('running');
++  const controlRef = useRef<string | null>(null);
++  const pauseBusyRef = useRef(false);
    const [isGenerating, setIsGenerating] = useState(false);
 +  const [batchProgress, setBatchProgress] = useState<UseGenerateClone['batchProgress']>(null);
    const [elapsedSeconds, setElapsedSeconds] = useState(0);
    const [progress, setProgress] = useState<number | null>(null);
    const [stage, setStage] = useState<UseGenerateClone['stage']>('preparing');
-@@ -350,124 +356,170 @@ function useGenerateController(): UseGenerateClone {
+@@ -350,124 +364,204 @@ function useGenerateController(): UseGenerateClone {
        }, TIMER_TICK_MS);
        const controller = new AbortController();
        abortRef.current = controller;
@@ -2751,6 +3061,8 @@ index a1a9f04..f44f24f 100644
 +      const initialSettings = settings;
 +      const bridge = getBridge();
 +      let batchToken: string | null = null;
++      let controlTimer: ReturnType<typeof setInterval> | null = null;
++      let controlPolling = false;
        try {
 -        // A preset-only engine that can't design never reads a style
 -        // instruct, and /generate refuses one there as a design request: the
@@ -2863,12 +3175,43 @@ index a1a9f04..f44f24f 100644
 -                  emotionAlpha: DEFAULT_CLONE_SETTINGS.emotionAlpha,
 -                  emotionVector: [...DEFAULT_CLONE_SETTINGS.emotionVector],
 -                }),
++        if (!design && (initialSettings.subtitleLines || jobs.length > 1)) {
++          const id = crypto.randomUUID().replaceAll('-', '');
++          await apiJson(`/generation-control/${id}/start`, { method: 'POST', signal: controller.signal });
++          controlRef.current = id;
++          setCanPause(true);
++          setPauseState('running');
++          controlTimer = setInterval(async () => {
++            if (controlPolling || controller.signal.aborted || controlRef.current !== id) return;
++            controlPolling = true;
++            try {
++              const status = await apiJson<{state: 'running' | 'pausing' | 'paused'}>(`/generation-control/${id}`, {signal: controller.signal});
++              if (controlRef.current === id && ['running','pausing','paused'].includes(status.state)) setPauseState(status.state);
++            } catch (error) {
++              if (!controller.signal.aborted) {
++                setError(describeError(error));
++                cancelledRef.current = true;
++                controller.abort();
++              }
++            } finally { controlPolling = false; }
++          }, 750);
++        }
 +        if (jobs.length > 1) {
 +          if (!bridge?.files.beginBatchExport) throw new Error(tr('clone.batch_desktop'));
 +          batchToken = await bridge.files.beginBatchExport();
 +          if (!batchToken || controller.signal.aborted) return;
 +        }
 +        for (const [index, job] of jobs.entries()) {
++          if (controller.signal.aborted) break;
++          if (controlRef.current) {
++            const id = controlRef.current;
++            while (!controller.signal.aborted) {
++              const status = await apiJson<{pause_requested?: boolean}>(`/generation-control/${id}`, {signal: controller.signal});
++              if (!status.pause_requested) break;
++              setPauseState('paused');
++              await new Promise(resolve => setTimeout(resolve, 100));
++            }
++          }
 +          if (controller.signal.aborted) break;
 +          setProgress(null);
 +          setStage('generating');
@@ -2899,6 +3242,7 @@ index a1a9f04..f44f24f 100644
 +          if (wording && instructVocabulary !== 'freeform')
 +            instruct = announceInstructWarnings(free);
 +          const input = {
++            generationControlId: controlRef.current ?? undefined,
 +            text: design?.text ?? settings.text,
 +            subtitleLines: !design && settings.subtitleLines,
 +            linePauseMs: settings.linePauseMs,
@@ -3026,15 +3370,21 @@ index a1a9f04..f44f24f 100644
        } catch (err) {
          if (!cancelledRef.current) {
            recordActionBreadcrumb(`generate:${reportMode}:error`);
-@@ -482,6 +534,7 @@ function useGenerateController(): UseGenerateClone {
+@@ -482,6 +576,13 @@ function useGenerateController(): UseGenerateClone {
            );
          }
        } finally {
++        if (controlTimer) clearInterval(controlTimer);
++        const controlId = controlRef.current;
++        controlRef.current = null;
++        setCanPause(false);
++        setPauseState('running');
++        if (controlId) await apiJson(`/generation-control/${controlId}/cancel`, {method: 'POST'}).catch(() => {});
 +        if (batchToken) await bridge?.files.endBatchExport(batchToken).catch(() => {});
          finishActivity();
          release();
          activeRef.current = false;
-@@ -490,6 +543,7 @@ function useGenerateController(): UseGenerateClone {
+@@ -490,6 +591,7 @@ function useGenerateController(): UseGenerateClone {
          if (timerRef.current) clearInterval(timerRef.current);
          timerRef.current = null;
          setIsGenerating(false);
@@ -3042,16 +3392,44 @@ index a1a9f04..f44f24f 100644
          setProgress(null);
          setModelStage(null);
          setModelProgress(null);
-@@ -525,6 +579,7 @@ function useGenerateController(): UseGenerateClone {
+@@ -517,14 +619,35 @@ function useGenerateController(): UseGenerateClone {
+     cancelledRef.current = true;
+     const reportMode = reportModeRef.current;
+     if (reportMode) recordActionBreadcrumb(`generate:${reportMode}:cancel`);
++    const id = controlRef.current;
++    if (id) void apiJson(`/generation-control/${id}/cancel`, {method:'POST'}).catch(() => {});
+     abortRef.current.abort();
+   }, []);
+ 
++  const controlAction = useCallback(async (action: 'pause' | 'resume') => {
++    const id = controlRef.current;
++    if (!id || pauseBusyRef.current) return;
++    pauseBusyRef.current = true;
++    try {
++      const status = await apiJson<{state: 'running' | 'pausing' | 'paused'}>(`/generation-control/${id}/${action}`, {method:'POST'});
++      if (controlRef.current === id) {
++        sawModelLoadRef.current = true; // Manual pauses must not train render-speed estimates.
++        setPauseState(status.state);
++      }
++    } catch (error) { toast.error(describeError(error)); }
++    finally { pauseBusyRef.current = false; }
++  }, []);
++
+   return {
+     generate: () => generate(),
      generateDesign: generate,
      cancel,
++    pause: () => controlAction('pause'),
++    resume: () => controlAction('resume'),
++    canPause,
++    pauseState,
      isGenerating,
 +    batchProgress,
      elapsedSeconds,
      progress,
      stage,
 diff --git a/electron/src/renderer/src/i18n/locales/ar.json b/electron/src/renderer/src/i18n/locales/ar.json
-index a262f27..9a37957 100644
+index a262f27..fa17783 100644
 --- a/electron/src/renderer/src/i18n/locales/ar.json
 +++ b/electron/src/renderer/src/i18n/locales/ar.json
 @@ -1,4 +1,20 @@
@@ -3099,7 +3477,17 @@ index a262f27..9a37957 100644
      "text_label": "النص",
      "paste": "لصق",
      "paste_failed": "تم حظر الوصول إلى الحافظة. الصق مباشرة في حقل النص باستخدام لوحة المفاتيح.",
-@@ -1905,7 +1929,7 @@
+@@ -762,7 +786,8 @@
+     "replace_reference_hint": "يؤدي الحفظ إلى استبدال العينة المرجعية لهذا الصوت. يُمسح المقطع المقفل والتحقق من الصوت الشخصي لأن المقطع الجديد قد يكون لمتحدث مختلف. اترك النص فارغًا لتفريغ المقطع الجديد تلقائيًا.",
+     "cannotCloneUseDesign": "لا يستطيع هذا النموذج استنساخ صوت. صِف صوتًا في تصميم الصوت، أو اختر نموذجًا يدعم الاستنساخ.",
+     "savedTab": "المحفوظة",
+-    "recentsTab": "الأخيرة"
++    "recentsTab": "الأخيرة",
++    "pausing_after_sentence": "جارٍ انتظار انتهاء الجملة…"
+   },
+   "designWorkspace": {
+     "title": "تصميم",
+@@ -1905,7 +1930,7 @@
      "toast_flushed": "متدفق — ذاكرة الوصول العشوائي {{ram}}G · VRAM {{vram}}G{{unloaded}}",
      "toast_model_unloaded": "· تم تفريغ النموذج",
      "toast_flush_failed": "فشل التدفق: {{message}}",
@@ -3109,7 +3497,7 @@ index a262f27..9a37957 100644
      "version_dev": "v{{version}} · تطوير",
      "tagline": "استنساخ الصوت المحلي. لا شيء يترك جهازك.",
 diff --git a/electron/src/renderer/src/i18n/locales/de.json b/electron/src/renderer/src/i18n/locales/de.json
-index fa7ec48..709c499 100644
+index fa7ec48..630a7e3 100644
 --- a/electron/src/renderer/src/i18n/locales/de.json
 +++ b/electron/src/renderer/src/i18n/locales/de.json
 @@ -1,4 +1,20 @@
@@ -3157,7 +3545,17 @@ index fa7ec48..709c499 100644
      "text_label": "Text",
      "paste": "Einfügen",
      "paste_failed": "Der Zugriff auf die Zwischenablage wurde blockiert. Füge den Inhalt mit der Tastatur direkt ins Textfeld ein.",
-@@ -1877,7 +1901,7 @@
+@@ -742,7 +766,8 @@
+     "replace_reference_hint": "Beim Speichern wird das Referenzbeispiel dieser Stimme ersetzt. Die fixierte Aufnahme und die Bestätigung der eigenen Stimme werden zurückgesetzt, da der neue Clip von einer anderen Person stammen kann. Lass das Transkript leer, um den neuen Clip automatisch zu transkribieren.",
+     "cannotCloneUseDesign": "Dieses Modell kann keine Stimme klonen. Beschreibe eine im Stimmdesign oder wähle ein Modell, das klonen kann.",
+     "savedTab": "Gespeichert",
+-    "recentsTab": "Zuletzt"
++    "recentsTab": "Zuletzt",
++    "pausing_after_sentence": "Warte auf das Satzende…"
+   },
+   "designWorkspace": {
+     "title": "Designen",
+@@ -1877,7 +1902,7 @@
      "toast_flushed": "Gespült – RAM {{ram}}G · VRAM {{vram}}G{{unloaded}}",
      "toast_model_unloaded": "· Modell entladen",
      "toast_flush_failed": "Spülung fehlgeschlagen: {{message}}",
@@ -3167,7 +3565,7 @@ index fa7ec48..709c499 100644
      "version_dev": "v{{version}} · Entwicklung",
      "tagline": "Klonen lokaler Stimmen. Nichts verlässt Ihre Maschine.",
 diff --git a/electron/src/renderer/src/i18n/locales/en.json b/electron/src/renderer/src/i18n/locales/en.json
-index 3bff2b4..ce49e0f 100644
+index 3bff2b4..86d430e 100644
 --- a/electron/src/renderer/src/i18n/locales/en.json
 +++ b/electron/src/renderer/src/i18n/locales/en.json
 @@ -1,4 +1,20 @@
@@ -3224,8 +3622,18 @@ index 3bff2b4..ce49e0f 100644
      "title": "Voice cloning",
      "text_label": "Script",
      "paste": "Paste",
+@@ -664,7 +688,8 @@
+     "replace_reference_hint": "Saving replaces this voice's reference sample. Its locked take and own-voice verification are cleared because the new clip may be a different speaker. Leave the transcript blank to transcribe the new clip automatically.",
+     "cannotCloneUseDesign": "This model can't clone a voice. Describe one in Voice design, or choose a model that clones.",
+     "savedTab": "Saved",
+-    "recentsTab": "Recents"
++    "recentsTab": "Recents",
++    "pausing_after_sentence": "Waiting for the current sentence to finish…"
+   },
+   "recording": {
+     "cleaned_loaded": "Recording cleaned and loaded.",
 diff --git a/electron/src/renderer/src/i18n/locales/es.json b/electron/src/renderer/src/i18n/locales/es.json
-index d9fe624..e94f786 100644
+index d9fe624..0ed3b49 100644
 --- a/electron/src/renderer/src/i18n/locales/es.json
 +++ b/electron/src/renderer/src/i18n/locales/es.json
 @@ -1,4 +1,20 @@
@@ -3273,7 +3681,17 @@ index d9fe624..e94f786 100644
      "text_label": "Texto",
      "paste": "Pegar",
      "paste_failed": "Se bloqueó el acceso al portapapeles. Pega directamente en el campo de texto con el teclado.",
-@@ -1879,7 +1903,7 @@
+@@ -744,7 +768,8 @@
+     "replace_reference_hint": "Al guardar se reemplaza la muestra de referencia de esta voz. La toma fijada y la verificación de voz propia se borran porque el nuevo clip puede ser de otra persona. Deja la transcripción vacía para transcribir el nuevo clip automáticamente.",
+     "cannotCloneUseDesign": "Este modelo no puede clonar una voz. Describe una en Diseño de voz o elige un modelo que clone.",
+     "savedTab": "Guardadas",
+-    "recentsTab": "Recientes"
++    "recentsTab": "Recientes",
++    "pausing_after_sentence": "Esperando a que termine la frase…"
+   },
+   "designWorkspace": {
+     "title": "Diseñar",
+@@ -1879,7 +1904,7 @@
      "toast_flushed": "Vaciado — RAM {{ram}}G · VRAM {{vram}}G{{unloaded}}",
      "toast_model_unloaded": "· modelo descargado",
      "toast_flush_failed": "Error de descarga: {{message}}",
@@ -3283,7 +3701,7 @@ index d9fe624..e94f786 100644
      "version_dev": "v{{version}} · Desarrollo",
      "tagline": "Clonación de voz local. Nada sale de tu máquina.",
 diff --git a/electron/src/renderer/src/i18n/locales/fr.json b/electron/src/renderer/src/i18n/locales/fr.json
-index 58671a8..ca378c1 100644
+index 58671a8..0234bc7 100644
 --- a/electron/src/renderer/src/i18n/locales/fr.json
 +++ b/electron/src/renderer/src/i18n/locales/fr.json
 @@ -1,4 +1,20 @@
@@ -3331,7 +3749,17 @@ index 58671a8..ca378c1 100644
      "text_label": "Texte",
      "paste": "Coller",
      "paste_failed": "L’accès au presse-papiers est bloqué. Collez directement dans le champ de texte avec le clavier.",
-@@ -1879,7 +1903,7 @@
+@@ -744,7 +768,8 @@
+     "replace_reference_hint": "L'enregistrement remplace l'échantillon de référence de cette voix. La prise verrouillée et la vérification de votre propre voix sont effacées, car le nouveau clip peut provenir d'une autre personne. Laissez la transcription vide pour transcrire automatiquement le nouveau clip.",
+     "cannotCloneUseDesign": "Ce modèle ne peut pas cloner une voix. Décrivez-en une dans Conception de voix ou choisissez un modèle qui clone.",
+     "savedTab": "Enregistrées",
+-    "recentsTab": "Récentes"
++    "recentsTab": "Récentes",
++    "pausing_after_sentence": "En attente de la fin de la phrase…"
+   },
+   "designWorkspace": {
+     "title": "Concevoir",
+@@ -1879,7 +1904,7 @@
      "toast_flushed": "Vidé — RAM {{ram}}G · VRAM {{vram}}G{{unloaded}}",
      "toast_model_unloaded": "· modèle déchargé",
      "toast_flush_failed": "Échec du rinçage : {{message}}",
@@ -3341,7 +3769,7 @@ index 58671a8..ca378c1 100644
      "version_dev": "v{{version}} · Développement",
      "tagline": "Clonage de voix locale. Rien ne quitte votre machine.",
 diff --git a/electron/src/renderer/src/i18n/locales/gl.json b/electron/src/renderer/src/i18n/locales/gl.json
-index 1584ca4..cd5b03e 100644
+index 1584ca4..6d4da77 100644
 --- a/electron/src/renderer/src/i18n/locales/gl.json
 +++ b/electron/src/renderer/src/i18n/locales/gl.json
 @@ -1,4 +1,20 @@
@@ -3398,8 +3826,18 @@ index 1584ca4..cd5b03e 100644
      "title": "Clonación de voz",
      "text_label": "Guión",
      "paste": "Pegar",
+@@ -664,7 +688,8 @@
+     "replace_reference_hint": "Ao gardar substitúe a mostra de referencia desta voz. Borráronse a súa toma bloqueada e a verificación de voz propia porque o novo clip pode ser un altofalante diferente. Deixa a transcrición en branco para transcribir o novo clip automaticamente.",
+     "cannotCloneUseDesign": "Este modelo non pode clonar unha voz. Describe un en Deseño de voz ou escolle un modelo que clone.",
+     "savedTab": "Gardado",
+-    "recentsTab": "Recentes"
++    "recentsTab": "Recentes",
++    "pausing_after_sentence": "Agardando a que remate a frase…"
+   },
+   "recording": {
+     "cleaned_loaded": "Gravación limpa e cargada.",
 diff --git a/electron/src/renderer/src/i18n/locales/hi.json b/electron/src/renderer/src/i18n/locales/hi.json
-index 9e76498..8f8dc5c 100644
+index 9e76498..db8fcbd 100644
 --- a/electron/src/renderer/src/i18n/locales/hi.json
 +++ b/electron/src/renderer/src/i18n/locales/hi.json
 @@ -1,4 +1,20 @@
@@ -3447,7 +3885,17 @@ index 9e76498..8f8dc5c 100644
      "text_label": "पाठ",
      "paste": "चिपकाएँ",
      "paste_failed": "क्लिपबोर्ड का उपयोग अवरुद्ध है। कीबोर्ड से सीधे पाठ फ़ील्ड में चिपकाएँ।",
-@@ -1877,7 +1901,7 @@
+@@ -742,7 +766,8 @@
+     "replace_reference_hint": "सहेजने पर इस आवाज़ का संदर्भ नमूना बदल जाता है। लॉक किया गया टेक और अपनी आवाज़ का सत्यापन हटा दिया जाता है, क्योंकि नई क्लिप किसी दूसरे वक्ता की हो सकती है। नई क्लिप को अपने-आप ट्रांसक्राइब करने के लिए ट्रांसक्रिप्ट खाली छोड़ें।",
+     "cannotCloneUseDesign": "यह मॉडल आवाज़ क्लोन नहीं कर सकता। वॉइस डिज़ाइन में एक आवाज़ का वर्णन करें, या क्लोन करने वाला मॉडल चुनें।",
+     "savedTab": "सहेजी गई",
+-    "recentsTab": "हालिया"
++    "recentsTab": "हालिया",
++    "pausing_after_sentence": "वर्तमान वाक्य पूरा होने की प्रतीक्षा…"
+   },
+   "designWorkspace": {
+     "title": "डिज़ाइन",
+@@ -1877,7 +1902,7 @@
      "toast_flushed": "फ्लश - RAM {{ram}}G · VRAM {{vram}}G{{unloaded}}",
      "toast_model_unloaded": "· मॉडल उतार दिया गया",
      "toast_flush_failed": "फ्लश विफल: {{message}}",
@@ -3457,7 +3905,7 @@ index 9e76498..8f8dc5c 100644
      "version_dev": "v{{version}} · डेवलपमेंट",
      "tagline": "स्थानीय आवाज क्लोनिंग. आपकी मशीन से कुछ भी नहीं छूटता.",
 diff --git a/electron/src/renderer/src/i18n/locales/id.json b/electron/src/renderer/src/i18n/locales/id.json
-index 3177154..53a19e0 100644
+index 3177154..5b7154b 100644
 --- a/electron/src/renderer/src/i18n/locales/id.json
 +++ b/electron/src/renderer/src/i18n/locales/id.json
 @@ -1,4 +1,20 @@
@@ -3505,7 +3953,17 @@ index 3177154..53a19e0 100644
      "text_label": "Teks",
      "paste": "Tempel",
      "paste_failed": "Akses papan klip diblokir. Tempel langsung ke kolom teks menggunakan papan ketik.",
-@@ -1877,7 +1901,7 @@
+@@ -742,7 +766,8 @@
+     "replace_reference_hint": "Menyimpan akan mengganti sampel referensi suara ini. Take yang dikunci dan verifikasi suara sendiri dihapus karena klip baru mungkin berasal dari pembicara lain. Biarkan transkrip kosong untuk mentranskripsikan klip baru secara otomatis.",
+     "cannotCloneUseDesign": "Model ini tidak bisa mengkloning suara. Deskripsikan suara di Desain suara, atau pilih model yang bisa mengkloning.",
+     "savedTab": "Tersimpan",
+-    "recentsTab": "Terbaru"
++    "recentsTab": "Terbaru",
++    "pausing_after_sentence": "Menunggu kalimat saat ini selesai…"
+   },
+   "designWorkspace": {
+     "title": "Desain",
+@@ -1877,7 +1902,7 @@
      "toast_flushed": "Dibilas — RAM {{ram}}G · VRAM {{vram}}G{{unloaded}}",
      "toast_model_unloaded": "· model dibongkar",
      "toast_flush_failed": "Gagal menyiram: {{message}}",
@@ -3515,7 +3973,7 @@ index 3177154..53a19e0 100644
      "version_dev": "v{{version}} · Pengembangan",
      "tagline": "Kloning suara lokal. Tidak ada yang meninggalkan mesin Anda.",
 diff --git a/electron/src/renderer/src/i18n/locales/it.json b/electron/src/renderer/src/i18n/locales/it.json
-index e3392fe..f95fbe0 100644
+index e3392fe..bacc298 100644
 --- a/electron/src/renderer/src/i18n/locales/it.json
 +++ b/electron/src/renderer/src/i18n/locales/it.json
 @@ -1,4 +1,20 @@
@@ -3563,7 +4021,17 @@ index e3392fe..f95fbe0 100644
      "text_label": "Testo",
      "paste": "Incolla",
      "paste_failed": "L’accesso agli appunti è bloccato. Incolla direttamente nel campo di testo con la tastiera.",
-@@ -1879,7 +1903,7 @@
+@@ -744,7 +768,8 @@
+     "replace_reference_hint": "Il salvataggio sostituisce il campione di riferimento di questa voce. La ripresa bloccata e la verifica della propria voce vengono cancellate perché la nuova clip potrebbe essere di un'altra persona. Lascia vuota la trascrizione per trascrivere automaticamente la nuova clip.",
+     "cannotCloneUseDesign": "Questo modello non può clonare una voce. Descrivine una in Design vocale o scegli un modello che clona.",
+     "savedTab": "Salvate",
+-    "recentsTab": "Recenti"
++    "recentsTab": "Recenti",
++    "pausing_after_sentence": "In attesa della fine della frase…"
+   },
+   "designWorkspace": {
+     "title": "Progetta",
+@@ -1879,7 +1904,7 @@
      "toast_flushed": "Scaricato — RAM {{ram}}G · VRAM {{vram}}G{{unloaded}}",
      "toast_model_unloaded": "· modello scarico",
      "toast_flush_failed": "Eliminazione non riuscita: {{message}}",
@@ -3573,7 +4041,7 @@ index e3392fe..f95fbe0 100644
      "version_dev": "v{{version}} · Sviluppo",
      "tagline": "Clonazione vocale locale. Niente lascia la tua macchina.",
 diff --git a/electron/src/renderer/src/i18n/locales/ja.json b/electron/src/renderer/src/i18n/locales/ja.json
-index a1f574a..fd1167c 100644
+index a1f574a..3fa172d 100644
 --- a/electron/src/renderer/src/i18n/locales/ja.json
 +++ b/electron/src/renderer/src/i18n/locales/ja.json
 @@ -1,4 +1,20 @@
@@ -3621,7 +4089,17 @@ index a1f574a..fd1167c 100644
      "text_label": "テキスト",
      "paste": "貼り付け",
      "paste_failed": "クリップボードへのアクセスが拒否されました。キーボードでテキスト欄に直接貼り付けてください。",
-@@ -1877,7 +1901,7 @@
+@@ -742,7 +766,8 @@
+     "replace_reference_hint": "保存すると、この音声の参照サンプルが置き換わります。新しいクリップは別の話者の可能性があるため、固定したテイクと本人音声の確認はリセットされます。書き起こしを空欄にすると、新しいクリップを自動で書き起こします。",
+     "cannotCloneUseDesign": "このモデルは声をクローンできません。ボイスデザインで声を説明するか、クローン対応モデルを選んでください。",
+     "savedTab": "保存済み",
+-    "recentsTab": "最近"
++    "recentsTab": "最近",
++    "pausing_after_sentence": "現在の文の完了を待っています…"
+   },
+   "designWorkspace": {
+     "title": "デザイン",
+@@ -1877,7 +1902,7 @@
      "toast_flushed": "フラッシュ — RAM {{ram}}G · VRAM {{vram}}G{{unloaded}}",
      "toast_model_unloaded": "· モデルがアンロードされました",
      "toast_flush_failed": "フラッシュに失敗しました: {{message}}",
@@ -3631,7 +4109,7 @@ index a1f574a..fd1167c 100644
      "version_dev": "v{{version}} · 開発",
      "tagline": "ローカル音声のクローン作成。マシンからは何も残りません。",
 diff --git a/electron/src/renderer/src/i18n/locales/ko.json b/electron/src/renderer/src/i18n/locales/ko.json
-index 1354233..067090c 100644
+index 1354233..2b1c274 100644
 --- a/electron/src/renderer/src/i18n/locales/ko.json
 +++ b/electron/src/renderer/src/i18n/locales/ko.json
 @@ -1,4 +1,20 @@
@@ -3679,7 +4157,17 @@ index 1354233..067090c 100644
      "text_label": "텍스트",
      "paste": "붙여넣기",
      "paste_failed": "클립보드 접근이 차단되었습니다. 키보드로 텍스트 입력란에 직접 붙여넣으세요.",
-@@ -1877,7 +1901,7 @@
+@@ -742,7 +766,8 @@
+     "seed_keep": "이 시드 유지",
+     "seed_reroll": "새 시드",
+     "stop_playback": "재생 중지",
+-    "title": "음성 복제"
++    "title": "음성 복제",
++    "pausing_after_sentence": "현재 문장이 끝나기를 기다리는 중…"
+   },
+   "designWorkspace": {
+     "title": "디자인",
+@@ -1877,7 +1902,7 @@
      "toast_flushed": "플러시 — RAM {{ram}}G · VRAM {{vram}}G{{unloaded}}",
      "toast_model_unloaded": "· 모델 언로드됨",
      "toast_flush_failed": "플러시 실패: {{message}}",
@@ -3689,7 +4177,7 @@ index 1354233..067090c 100644
      "version_dev": "v{{version}} · 개발",
      "tagline": "로컬 음성 복제. 당신의 기계에는 아무것도 남지 않습니다.",
 diff --git a/electron/src/renderer/src/i18n/locales/nl.json b/electron/src/renderer/src/i18n/locales/nl.json
-index 7e5b393..861c5d9 100644
+index 7e5b393..b7ccda9 100644
 --- a/electron/src/renderer/src/i18n/locales/nl.json
 +++ b/electron/src/renderer/src/i18n/locales/nl.json
 @@ -1,4 +1,20 @@
@@ -3737,7 +4225,17 @@ index 7e5b393..861c5d9 100644
      "text_label": "Tekst",
      "paste": "Plakken",
      "paste_failed": "Toegang tot het klembord is geblokkeerd. Plak rechtstreeks in het tekstveld met het toetsenbord.",
-@@ -1877,7 +1901,7 @@
+@@ -742,7 +766,8 @@
+     "replace_reference_hint": "Opslaan vervangt het referentievoorbeeld van deze stem. De vastgezette opname en de verificatie van je eigen stem worden gewist, omdat de nieuwe clip van een andere spreker kan zijn. Laat het transcript leeg om de nieuwe clip automatisch te transcriberen.",
+     "cannotCloneUseDesign": "Dit model kan geen stem klonen. Beschrijf er een in Stemontwerp of kies een model dat kan klonen.",
+     "savedTab": "Opgeslagen",
+-    "recentsTab": "Recent"
++    "recentsTab": "Recent",
++    "pausing_after_sentence": "Wachten tot de huidige zin klaar is…"
+   },
+   "designWorkspace": {
+     "title": "Ontwerpen",
+@@ -1877,7 +1902,7 @@
      "toast_flushed": "Gespoeld — RAM {{ram}}G · VRAM {{vram}}G{{unloaded}}",
      "toast_model_unloaded": "· model onbeladen",
      "toast_flush_failed": "Spoelen mislukt: {{message}}",
@@ -3747,7 +4245,7 @@ index 7e5b393..861c5d9 100644
      "version_dev": "v{{version}} · Ontwikkeling",
      "tagline": "Lokaal stemklonen. Niets verlaat uw machine.",
 diff --git a/electron/src/renderer/src/i18n/locales/pl.json b/electron/src/renderer/src/i18n/locales/pl.json
-index 740d4fa..7f854fb 100644
+index 740d4fa..9a3e5a5 100644
 --- a/electron/src/renderer/src/i18n/locales/pl.json
 +++ b/electron/src/renderer/src/i18n/locales/pl.json
 @@ -1,4 +1,20 @@
@@ -3795,7 +4293,17 @@ index 740d4fa..7f854fb 100644
      "text_label": "Tekst",
      "paste": "Wklej",
      "paste_failed": "Dostęp do schowka został zablokowany. Wklej bezpośrednio do pola tekstowego za pomocą klawiatury.",
-@@ -1891,7 +1915,7 @@
+@@ -752,7 +776,8 @@
+     "replace_reference_hint": "Zapisanie zastępuje próbkę referencyjną tego głosu. Zablokowane nagranie i weryfikacja własnego głosu zostaną wyczyszczone, ponieważ nowy klip może należeć do innej osoby. Zostaw transkrypcję pustą, aby nowy klip został przepisany automatycznie.",
+     "cannotCloneUseDesign": "Ten model nie potrafi klonować głosu. Opisz głos w Projektowaniu głosu lub wybierz model, który klonuje.",
+     "savedTab": "Zapisane",
+-    "recentsTab": "Ostatnie"
++    "recentsTab": "Ostatnie",
++    "pausing_after_sentence": "Oczekiwanie na zakończenie zdania…"
+   },
+   "designWorkspace": {
+     "title": "Projektuj",
+@@ -1891,7 +1916,7 @@
      "toast_flushed": "Opróżniony — RAM {{ram}}G · VRAM {{vram}}G{{unloaded}}",
      "toast_model_unloaded": "· model rozładowany",
      "toast_flush_failed": "Spłukiwanie nie powiodło się: {{message}}",
@@ -3805,7 +4313,7 @@ index 740d4fa..7f854fb 100644
      "version_dev": "v{{version}} · Deweloperska",
      "tagline": "Lokalne klonowanie głosu. Nic nie opuszcza Twojej maszyny.",
 diff --git a/electron/src/renderer/src/i18n/locales/pt.json b/electron/src/renderer/src/i18n/locales/pt.json
-index 41544d5..bf449d0 100644
+index 41544d5..25b4389 100644
 --- a/electron/src/renderer/src/i18n/locales/pt.json
 +++ b/electron/src/renderer/src/i18n/locales/pt.json
 @@ -1,4 +1,20 @@
@@ -3853,7 +4361,17 @@ index 41544d5..bf449d0 100644
      "text_label": "Texto",
      "paste": "Colar",
      "paste_failed": "O acesso à área de transferência foi bloqueado. Cole diretamente no campo de texto usando o teclado.",
-@@ -1879,7 +1903,7 @@
+@@ -744,7 +768,8 @@
+     "replace_reference_hint": "Salvar substitui a amostra de referência desta voz. A tomada bloqueada e a verificação de voz própria são removidas porque o novo clipe pode ser de outra pessoa. Deixe a transcrição em branco para transcrever o novo clipe automaticamente.",
+     "cannotCloneUseDesign": "Este modelo não consegue clonar uma voz. Descreva uma em Design de voz ou escolha um modelo que clone.",
+     "savedTab": "Salvas",
+-    "recentsTab": "Recentes"
++    "recentsTab": "Recentes",
++    "pausing_after_sentence": "Aguardando o fim da frase atual…"
+   },
+   "designWorkspace": {
+     "title": "Desenhar",
+@@ -1879,7 +1904,7 @@
      "toast_flushed": "Liberado — RAM {{ram}}G · VRAM {{vram}}G{{unloaded}}",
      "toast_model_unloaded": "· modelo descarregado",
      "toast_flush_failed": "Falha na liberação: {{message}}",
@@ -3863,7 +4381,7 @@ index 41544d5..bf449d0 100644
      "version_dev": "v{{version}} · Desenvolvimento",
      "coming_soon": "Em breve",
 diff --git a/electron/src/renderer/src/i18n/locales/ru.json b/electron/src/renderer/src/i18n/locales/ru.json
-index 91e78c7..f1ab243 100644
+index 91e78c7..f8f1d53 100644
 --- a/electron/src/renderer/src/i18n/locales/ru.json
 +++ b/electron/src/renderer/src/i18n/locales/ru.json
 @@ -1,4 +1,20 @@
@@ -3911,7 +4429,17 @@ index 91e78c7..f1ab243 100644
      "text_label": "Текст",
      "paste": "Вставить",
      "paste_failed": "Доступ к буферу обмена заблокирован. Вставьте текст прямо в поле с помощью клавиатуры.",
-@@ -1891,7 +1915,7 @@
+@@ -752,7 +776,8 @@
+     "replace_reference_hint": "При сохранении образец этого голоса будет заменён. Закреплённый дубль и подтверждение собственного голоса сбрасываются, так как новый клип может принадлежать другому человеку. Оставьте расшифровку пустой, чтобы новый клип был расшифрован автоматически.",
+     "cannotCloneUseDesign": "Эта модель не умеет клонировать голос. Опишите голос в разделе «Дизайн голоса» или выберите модель с клонированием.",
+     "savedTab": "Сохранённые",
+-    "recentsTab": "Недавние"
++    "recentsTab": "Недавние",
++    "pausing_after_sentence": "Ожидание завершения текущего предложения…"
+   },
+   "designWorkspace": {
+     "title": "Создать",
+@@ -1891,7 +1916,7 @@
      "toast_flushed": "Сброшено — ОЗУ {{ram}}G · VRAM {{vram}}G{{unloaded}}",
      "toast_model_unloaded": "· модель выгружена",
      "toast_flush_failed": "Сброс не выполнен: {{message}}",
@@ -3921,7 +4449,7 @@ index 91e78c7..f1ab243 100644
      "version_dev": "v{{version}} · Разработка",
      "tagline": "Локальное клонирование голоса. Ничто не покидает вашу машину.",
 diff --git a/electron/src/renderer/src/i18n/locales/sv.json b/electron/src/renderer/src/i18n/locales/sv.json
-index 87ca95d..3ec22ff 100644
+index 87ca95d..025cd38 100644
 --- a/electron/src/renderer/src/i18n/locales/sv.json
 +++ b/electron/src/renderer/src/i18n/locales/sv.json
 @@ -1,4 +1,20 @@
@@ -3969,7 +4497,17 @@ index 87ca95d..3ec22ff 100644
      "text_label": "Text",
      "paste": "Klistra in",
      "paste_failed": "Åtkomst till urklipp blockerades. Klistra in direkt i textfältet med tangentbordet.",
-@@ -1877,7 +1901,7 @@
+@@ -742,7 +766,8 @@
+     "replace_reference_hint": "När du sparar ersätts röstens referensprov. Den låsta tagningen och verifieringen av egen röst rensas eftersom det nya klippet kan vara en annan talare. Lämna transkriptionen tom för att transkribera det nya klippet automatiskt.",
+     "cannotCloneUseDesign": "Den här modellen kan inte klona en röst. Beskriv en i Röstdesign eller välj en modell som klonar.",
+     "savedTab": "Sparade",
+-    "recentsTab": "Senaste"
++    "recentsTab": "Senaste",
++    "pausing_after_sentence": "Väntar på att den aktuella meningen ska bli klar…"
+   },
+   "designWorkspace": {
+     "title": "Designa",
+@@ -1877,7 +1902,7 @@
      "toast_flushed": "Spolat — RAM {{ram}}G · VRAM {{vram}}G{{unloaded}}",
      "toast_model_unloaded": "· modell avlastad",
      "toast_flush_failed": "Spolning misslyckades: {{message}}",
@@ -3979,7 +4517,7 @@ index 87ca95d..3ec22ff 100644
      "version_dev": "v{{version}} · Utveckling",
      "tagline": "Lokal röstkloning. Inget lämnar din maskin.",
 diff --git a/electron/src/renderer/src/i18n/locales/th.json b/electron/src/renderer/src/i18n/locales/th.json
-index af3dd30..722f0e1 100644
+index af3dd30..9395c34 100644
 --- a/electron/src/renderer/src/i18n/locales/th.json
 +++ b/electron/src/renderer/src/i18n/locales/th.json
 @@ -1,4 +1,20 @@
@@ -4027,7 +4565,17 @@ index af3dd30..722f0e1 100644
      "text_label": "ข้อความ",
      "paste": "วาง",
      "paste_failed": "การเข้าถึงคลิปบอร์ดถูกบล็อก โปรดใช้แป้นพิมพ์วางลงในช่องข้อความโดยตรง",
-@@ -1877,7 +1901,7 @@
+@@ -742,7 +766,8 @@
+     "replace_reference_hint": "การบันทึกจะแทนที่ตัวอย่างเสียงอ้างอิงของเสียงนี้ เทคที่ล็อกไว้และการยืนยันเสียงของตนเองจะถูกล้าง เพราะคลิปใหม่อาจเป็นผู้พูดคนอื่น เว้นข้อความถอดเสียงว่างไว้เพื่อถอดเสียงคลิปใหม่โดยอัตโนมัติ",
+     "cannotCloneUseDesign": "โมเดลนี้โคลนเสียงไม่ได้ ให้บรรยายเสียงในการออกแบบเสียง หรือเลือกโมเดลที่โคลนได้",
+     "savedTab": "ที่บันทึก",
+-    "recentsTab": "ล่าสุด"
++    "recentsTab": "ล่าสุด",
++    "pausing_after_sentence": "กำลังรอให้ประโยคปัจจุบันเสร็จ…"
+   },
+   "designWorkspace": {
+     "title": "สร้างเสียง",
+@@ -1877,7 +1902,7 @@
      "toast_flushed": "ฟลัช — RAM {{ram}}G · VRAM {{vram}}G{{unloaded}}",
      "toast_model_unloaded": "· โมเดลยกเลิกการโหลดแล้ว",
      "toast_flush_failed": "การฟลัชล้มเหลว: {{message}}",
@@ -4037,7 +4585,7 @@ index af3dd30..722f0e1 100644
      "version_dev": "v{{version}} · สำหรับพัฒนา",
      "tagline": "การโคลนเสียงท้องถิ่น ไม่มีอะไรเหลือจากเครื่องของคุณ",
 diff --git a/electron/src/renderer/src/i18n/locales/tr.json b/electron/src/renderer/src/i18n/locales/tr.json
-index 4822ea4..3029daa 100644
+index 4822ea4..e275c31 100644
 --- a/electron/src/renderer/src/i18n/locales/tr.json
 +++ b/electron/src/renderer/src/i18n/locales/tr.json
 @@ -1,4 +1,20 @@
@@ -4085,7 +4633,17 @@ index 4822ea4..3029daa 100644
      "text_label": "Metin",
      "paste": "Yapıştır",
      "paste_failed": "Pano erişimi engellendi. Klavyeyi kullanarak doğrudan metin alanına yapıştırın.",
-@@ -1877,7 +1901,7 @@
+@@ -742,7 +766,8 @@
+     "replace_reference_hint": "Kaydetmek bu sesin referans örneğini değiştirir. Yeni klip farklı bir konuşmacıya ait olabileceğinden kilitli kayıt ve kendi ses doğrulaması temizlenir. Yeni klibin otomatik olarak yazıya dökülmesi için transkripti boş bırakın.",
+     "cannotCloneUseDesign": "Bu model ses klonlayamaz. Ses tasarımında bir ses tarif edin veya klonlayan bir model seçin.",
+     "savedTab": "Kayıtlı",
+-    "recentsTab": "Son"
++    "recentsTab": "Son",
++    "pausing_after_sentence": "Geçerli cümlenin bitmesi bekleniyor…"
+   },
+   "designWorkspace": {
+     "title": "Tasarla",
+@@ -1877,7 +1902,7 @@
      "toast_flushed": "Temizlenmiş — RAM {{ram}}G · VRAM {{vram}}G{{unloaded}}",
      "toast_model_unloaded": "· model boşaltıldı",
      "toast_flush_failed": "Temizleme başarısız oldu: {{message}}",
@@ -4095,7 +4653,7 @@ index 4822ea4..3029daa 100644
      "version_dev": "v{{version}} · Geliştirme",
      "tagline": "Yerel ses klonlama. Hiçbir şey makinenizden ayrılmaz.",
 diff --git a/electron/src/renderer/src/i18n/locales/uk.json b/electron/src/renderer/src/i18n/locales/uk.json
-index f43879d..8efabe9 100644
+index f43879d..33f9641 100644
 --- a/electron/src/renderer/src/i18n/locales/uk.json
 +++ b/electron/src/renderer/src/i18n/locales/uk.json
 @@ -1,4 +1,20 @@
@@ -4143,7 +4701,17 @@ index f43879d..8efabe9 100644
      "text_label": "Текст",
      "paste": "Вставити",
      "paste_failed": "Доступ до буфера обміну заблоковано. Вставте текст безпосередньо в поле за допомогою клавіатури.",
-@@ -1891,7 +1915,7 @@
+@@ -752,7 +776,8 @@
+     "replace_reference_hint": "Під час збереження зразок цього голосу буде замінено. Закріплений дубль і підтвердження власного голосу скидаються, бо новий кліп може належати іншій людині. Залиште розшифровку порожньою, щоб новий кліп розшифрувався автоматично.",
+     "cannotCloneUseDesign": "Ця модель не вміє клонувати голос. Опишіть голос у розділі «Дизайн голосу» або виберіть модель із клонуванням.",
+     "savedTab": "Збережені",
+-    "recentsTab": "Нещодавні"
++    "recentsTab": "Нещодавні",
++    "pausing_after_sentence": "Очікування завершення поточного речення…"
+   },
+   "designWorkspace": {
+     "title": "Створити",
+@@ -1891,7 +1916,7 @@
      "toast_flushed": "Очищено — RAM {{ram}}G · VRAM {{vram}}G{{unloaded}}",
      "toast_model_unloaded": "· модель ненавантажена",
      "toast_flush_failed": "Помилка очищення: {{message}}",
@@ -4153,7 +4721,7 @@ index f43879d..8efabe9 100644
      "version_dev": "v{{version}} · Розробка",
      "tagline": "Клонування локального голосу. Ніщо не покидає вашу машину.",
 diff --git a/electron/src/renderer/src/i18n/locales/vi.json b/electron/src/renderer/src/i18n/locales/vi.json
-index 84feeaa..2c66ef7 100644
+index 84feeaa..035104d 100644
 --- a/electron/src/renderer/src/i18n/locales/vi.json
 +++ b/electron/src/renderer/src/i18n/locales/vi.json
 @@ -1,4 +1,20 @@
@@ -4201,7 +4769,17 @@ index 84feeaa..2c66ef7 100644
      "text_label": "Văn bản",
      "paste": "Dán",
      "paste_failed": "Quyền truy cập bảng nhớ tạm đã bị chặn. Hãy dùng bàn phím để dán trực tiếp vào ô văn bản.",
-@@ -1877,7 +1901,7 @@
+@@ -742,7 +766,8 @@
+     "replace_reference_hint": "Khi lưu, mẫu tham chiếu của giọng này sẽ được thay thế. Bản thu đã khóa và xác minh giọng của chính bạn sẽ bị xóa vì đoạn mới có thể là của người nói khác. Để trống bản chép lời để tự động chép lời đoạn mới.",
+     "cannotCloneUseDesign": "Mô hình này không thể nhân bản giọng. Hãy mô tả giọng trong Thiết kế giọng, hoặc chọn mô hình hỗ trợ nhân bản.",
+     "savedTab": "Đã lưu",
+-    "recentsTab": "Gần đây"
++    "recentsTab": "Gần đây",
++    "pausing_after_sentence": "Đang chờ hết câu…"
+   },
+   "designWorkspace": {
+     "title": "Thiết kế",
+@@ -1877,7 +1902,7 @@
      "toast_flushed": "Đã xóa — RAM {{ram}}G · VRAM {{vram}}G{{unloaded}}",
      "toast_model_unloaded": "· dỡ mô hình",
      "toast_flush_failed": "Xóa không thành công: {{message}}",
@@ -4211,7 +4789,7 @@ index 84feeaa..2c66ef7 100644
      "version_dev": "v{{version}} · Phát triển",
      "tagline": "Nhân bản giọng nói địa phương. Không có gì rời khỏi máy của bạn.",
 diff --git a/electron/src/renderer/src/i18n/locales/zh-CN.json b/electron/src/renderer/src/i18n/locales/zh-CN.json
-index 91c77fc..7f2f40b 100644
+index 91c77fc..1582604 100644
 --- a/electron/src/renderer/src/i18n/locales/zh-CN.json
 +++ b/electron/src/renderer/src/i18n/locales/zh-CN.json
 @@ -1,4 +1,20 @@
@@ -4259,7 +4837,17 @@ index 91c77fc..7f2f40b 100644
      "text_label": "文本",
      "paste": "粘贴",
      "paste_failed": "剪贴板访问被阻止。请使用键盘直接粘贴到文本框中。",
-@@ -1877,7 +1901,7 @@
+@@ -757,7 +781,8 @@
+     "toggle_sidebar": "切换侧边栏",
+     "transcript": "转写文本",
+     "tshift": "t_shift",
+-    "voice_source": "声音来源"
++    "voice_source": "声音来源",
++    "pausing_after_sentence": "等待当前句子完成…"
+   },
+   "designWorkspace": {
+     "title": "设计",
+@@ -1877,7 +1902,7 @@
      "toast_flushed": "刷新 — RAM {{ram}}G · VRAM {{vram}}G{{unloaded}}",
      "toast_model_unloaded": "· 模型卸载",
      "toast_flush_failed": "刷新失败：{{message}}",
@@ -4269,7 +4857,7 @@ index 91c77fc..7f2f40b 100644
      "version_dev": "v{{version}} · 开发版",
      "tagline": "本地语音克隆。没有任何东西离开你的机器。",
 diff --git a/electron/src/renderer/src/i18n/locales/zh-TW.json b/electron/src/renderer/src/i18n/locales/zh-TW.json
-index 5dad25f..121ac7b 100644
+index 5dad25f..ad0c849 100644
 --- a/electron/src/renderer/src/i18n/locales/zh-TW.json
 +++ b/electron/src/renderer/src/i18n/locales/zh-TW.json
 @@ -1,4 +1,20 @@
@@ -4317,7 +4905,17 @@ index 5dad25f..121ac7b 100644
      "text_label": "文字",
      "paste": "貼上",
      "paste_failed": "剪貼簿存取遭到封鎖。請使用鍵盤直接貼上到文字欄位。",
-@@ -1877,7 +1901,7 @@
+@@ -742,7 +766,8 @@
+     "replace_reference_hint": "儲存後將替換此音色的參考樣本。由於新片段可能來自其他說話者，已鎖定的片段和本人聲音驗證會被清除。逐字稿留空即可自動轉寫新片段。",
+     "cannotCloneUseDesign": "此模型無法複製聲音。請在聲音設計中描述一個聲音，或選擇支援複製的模型。",
+     "savedTab": "已儲存",
+-    "recentsTab": "最近"
++    "recentsTab": "最近",
++    "pausing_after_sentence": "等待目前句子完成…"
+   },
+   "designWorkspace": {
+     "title": "設計聲音",
+@@ -1877,7 +1902,7 @@
      "toast_flushed": "刷新 — RAM {{ram}}G · VRAM {{vram}}G{{unloaded}}",
      "toast_model_unloaded": "· 模型卸載",
      "toast_flush_failed": "刷新失敗：{{message}}",
@@ -4327,7 +4925,7 @@ index 5dad25f..121ac7b 100644
      "version_dev": "v{{version}} · 開發版",
      "tagline": "本地語音克隆。沒有任何東西可以離開你的機器。",
 diff --git a/electron/src/renderer/src/lib/api/generate.test.ts b/electron/src/renderer/src/lib/api/generate.test.ts
-index 8894131..cf52622 100644
+index 8894131..498b081 100644
 --- a/electron/src/renderer/src/lib/api/generate.test.ts
 +++ b/electron/src/renderer/src/lib/api/generate.test.ts
 @@ -129,7 +129,9 @@ describe('toGenerateForm', () => {
@@ -4357,7 +4955,7 @@ index 8894131..cf52622 100644
        durationSeconds: null,
        genTimeSeconds: null,
        seed: null,
-@@ -572,4 +576,35 @@ it('sends the saved profile and its reference text on the streaming route', asyn
+@@ -572,4 +576,41 @@ it('sends the saved profile and its reference text on the streaming route', asyn
    const form = vi.mocked(fetch).mock.calls[0][1]?.body as FormData;
    expect(form.get('profile_id')).toBe('saved-voice');
    expect(form.get('ref_text')).toBe('Reference words');
@@ -4395,11 +4993,17 @@ index 8894131..cf52622 100644
 +  ).toBe('900');
 +  expect(toGenerateForm(BASE_INPUT).get('line_pause_ms')).toBeNull();
 +});
++
++it('sends the batch control only for line generation', () => {
++  const id='a'.repeat(32);
++  expect(toGenerateForm({...BASE_INPUT,subtitleLines:true,generationControlId:id}).get('generation_control_id')).toBe(id);
++  expect(toGenerateForm({...BASE_INPUT,generationControlId:id}).get('generation_control_id')).toBeNull();
++});
 diff --git a/electron/src/renderer/src/lib/api/generate.ts b/electron/src/renderer/src/lib/api/generate.ts
-index 01ddf78..105139f 100644
+index 01ddf78..568b6d8 100644
 --- a/electron/src/renderer/src/lib/api/generate.ts
 +++ b/electron/src/renderer/src/lib/api/generate.ts
-@@ -146,12 +146,15 @@ function instructField(input: CloneGenerateInput): string {
+@@ -146,12 +146,16 @@ function instructField(input: CloneGenerateInput): string {
   */
  export function toGenerateForm(
    input: CloneGenerateInput,
@@ -4411,6 +5015,7 @@ index 01ddf78..105139f 100644
  ): FormData {
    const form = new FormData();
    form.append('text', input.text);
++  if (input.generationControlId && input.subtitleLines) form.append('generation_control_id', input.generationControlId);
 +  if (input.subtitleLines) {
 +    form.append('subtitle_lines', 'true');
 +    form.append('line_pause_ms', String(input.linePauseMs ?? 500));
@@ -4418,7 +5023,7 @@ index 01ddf78..105139f 100644
    if (input.seed !== undefined && Number.isInteger(input.seed))
      form.append('seed', String(input.seed));
    // Auto must be explicit: omission inherits the saved profile's default.
-@@ -218,6 +221,7 @@ export function parseGenerateHeaders(headers: Headers): Omit<GenerateResult, 'bl
+@@ -218,6 +222,7 @@ export function parseGenerateHeaders(headers: Headers): Omit<GenerateResult, 'bl
    return {
      id: headers.get('X-Audio-Id'),
      audioPath: headers.get('X-Audio-Path'),
@@ -4426,7 +5031,16 @@ index 01ddf78..105139f 100644
      durationSeconds: headerFloat(headers, 'X-Audio-Duration'),
      genTimeSeconds: headerFloat(headers, 'X-Gen-Time'),
      seed: headerInt(headers, 'X-Seed'),
-@@ -436,7 +440,10 @@ export async function generateClone(
+@@ -424,7 +429,7 @@ export async function generateClone(
+   // budget read still in flight (just after connecting) is awaited briefly so
+   // an operator-raised timeout is not missed.
+   if (generateBudgetPending()) await generateBudgetSettled(2_000);
+-  const backstop = setTimeout(
++  const backstop = input.generationControlId ? undefined : setTimeout(
+     forwardAbort,
+     generateAbortMs(input.text.length, reportedGenerateBudget()),
+   );
+@@ -436,7 +441,10 @@ export async function generateClone(
        signal: controller.signal,
      });
      const blob = await readAudioBody(res, opts.onProgress);
@@ -4439,7 +5053,7 @@ index 01ddf78..105139f 100644
      finishActivity();
      clearTimeout(backstop);
 diff --git a/electron/src/renderer/src/lib/api/types.ts b/electron/src/renderer/src/lib/api/types.ts
-index 2d9d28a..e95b577 100644
+index 2d9d28a..b9d788b 100644
 --- a/electron/src/renderer/src/lib/api/types.ts
 +++ b/electron/src/renderer/src/lib/api/types.ts
 @@ -39,6 +39,7 @@ export interface Profile {
@@ -4450,16 +5064,17 @@ index 2d9d28a..e95b577 100644
    id: string;
    text: string;
    mode: string; // 'clone' | 'design' | ...
-@@ -169,6 +170,8 @@ export interface DesignRecipe {
+@@ -169,6 +170,9 @@ export interface DesignRecipe {
  /** Everything the clone form sends. Names are the UI names; `toGenerateForm`
   *  in generate.ts maps them to the multipart field names. */
  export interface CloneGenerateInput {
++  generationControlId?: string;
 +  subtitleLines?: boolean;
 +  linePauseMs?: number;
    /** Built-in voice id for engines that ship presets. */
    presetVoice?: string;
    wavBits?: 16 | 24 | 32;
-@@ -208,6 +211,8 @@ export interface CloneGenerateInput {
+@@ -208,6 +212,8 @@ export interface CloneGenerateInput {
  }
  
  export interface GenerateResult {
@@ -4794,6 +5409,98 @@ index 0000000..bd52146
 +Write-Host 'For multiple TXT files: select WAV/MP3 + SRT, synthesize, then choose one output folder.'
 +Write-Host "Backup kept at: $backupDir"
 +Write-Host 'Saved voices, models, projects, settings and license acceptances were not changed.'
+diff --git a/tests/test_generation_control.py b/tests/test_generation_control.py
+new file mode 100644
+index 0000000..ca69e83
+--- /dev/null
++++ b/tests/test_generation_control.py
+@@ -0,0 +1,86 @@
++"""No inference dependencies: pauses preserve completed sentences and SRT clocks."""
++import asyncio
++import sys
++import time
++import unittest
++from pathlib import Path
++sys.path.insert(0, str(Path(__file__).parents[1] / 'backend'))
++from services.generation_control import start, get, cancel, controls
++from services.line_subtitles import LineClock
++
++async def connected(): return False
++async def disconnected(): return True
++KEY = 'a' * 32
++
++class BatchControlTests(unittest.IsolatedAsyncioTestCase):
++    def setUp(self): controls.clear()
++    def tearDown(self):
++        for state in controls.values():state.cancelled=True
++        controls.clear()
++
++    async def test_pause_finishes_current_sentence_then_resumes_without_repeats(self):
++        state=start(KEY);state.claimed=True
++        first_started=asyncio.Event();finish_first=asyncio.Event();rendered=[]
++        clock=LineClock(['first','second'])
++        async def run():
++            await state.checkpoint(connected)
++            for index,frames in enumerate([24000,48000]):
++                if index==0:
++                    first_started.set();await finish_first.wait()
++                rendered.append(index);clock.append(frames,24000,500)
++                await state.checkpoint(connected)
++        task=asyncio.create_task(run())
++        await first_started.wait()
++        state.requested=True;state.phase='pausing'
++        self.assertEqual(rendered,[])
++        finish_first.set()
++        for _ in range(100):
++            if state.phase=='paused':break
++            await asyncio.sleep(0.005)
++        self.assertEqual(state.phase,'paused')
++        self.assertEqual(rendered,[0]);self.assertFalse(task.done())
++        state.requested=False;state.touch()
++        await asyncio.wait_for(task,1)
++        self.assertEqual(rendered,[0,1])
++        self.assertEqual(clock.frames,84000)
++        self.assertIn('00:00:01,500 --> 00:00:03,500',clock.srt())
++
++    async def test_cancel_wakes_paused_work(self):
++        state=start(KEY);state.requested=True
++        task=asyncio.create_task(state.checkpoint(connected));await asyncio.sleep(0)
++        cancel(KEY)
++        with self.assertRaises(asyncio.CancelledError):await asyncio.wait_for(task,1)
++        self.assertNotIn(KEY,controls)
++
++    async def test_disconnection_stops_work_and_open_paused_request_does_not_expire(self):
++        state=start(KEY)
++        with self.assertRaises(asyncio.CancelledError):await state.checkpoint(disconnected)
++        state.claimed=True
++        state.touched=time.monotonic()-3600
++        self.assertIs(get(KEY),state)
++        await state.checkpoint(connected)
++
++    async def test_pause_between_files_and_resume_before_boundary(self):
++        state=start(KEY);state.requested=True
++        self.assertEqual(state.status()['state'],'paused')
++        state.requested=False
++        await state.checkpoint(connected)
++        self.assertEqual(state.phase,'running')
++
++    async def test_registry_rejects_duplicates_and_bad_ids_and_prunes_expired(self):
++        with self.assertRaises(ValueError):start('../escape')
++        state=start(KEY)
++        with self.assertRaises(ValueError):start(KEY)
++        state.touched=time.monotonic()-301
++        with self.assertRaises(KeyError):get(KEY)
++        start('b'*32)
++        self.assertNotIn(KEY,controls)
++        self.assertTrue(state.cancelled)
++
++    async def test_other_batch_is_not_paused(self):
++        first=start(KEY);first.requested=True
++        other=start('b'*32)
++        await asyncio.wait_for(other.checkpoint(connected),1)
++        self.assertEqual(other.phase,'running')
++
++if __name__=='__main__':unittest.main()
 diff --git a/tests/test_line_subtitle_finalize.py b/tests/test_line_subtitle_finalize.py
 new file mode 100644
 index 0000000..4e71560

@@ -65,3 +65,12 @@ Mô hình có hỗ trợ chỉ dẫn/điều khiển cảm xúc sẽ nhận hư�
 Đây không phải cam kết diễn đạt đúng mọi sắc thái, ngôn ngữ hay tạo tiếng động.
 Các tiếng chậc lưỡi, hít gấp, nuốt khan chưa có bộ tạo riêng và được bỏ qua;
 scoff được dùng làm gợi ý khinh miệt nếu mô hình hỗ trợ.
+
+TẠM DỪNG / TIẾP TỤC TXT
+Khi tạo trong chế độ Audio + SRT, có hai nút Tạm dừng và Tiếp tục.
+Tạm dừng chờ câu đang tạo xong rồi mới dừng; trạng thái hiển thị rõ khi đang
+chờ hết câu và khi đã dừng. Có thể tiếp tục ngay cả khi còn đang chờ hết câu.
+Tiếp tục dùng lại các câu đã tạo trong bộ nhớ, không tạo lại tệp đã xuất.
+Thời gian bạn tạm dừng không được cộng vào SRT. Nút hủy vẫn hoạt động.
+Giữ app mở trong lúc tạm dừng. Không lưu tiến độ để tiếp tục sau khi đóng app
+hoặc khởi động lại máy; tệp đã xuất xong vẫn được giữ trong thư mục đầu ra.

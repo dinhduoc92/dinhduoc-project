@@ -24,9 +24,9 @@ for item in [authority['authority'], *authority['additionalAuthorities']]:
 bun=TOOLS/'node_modules/bun/bin/bun.exe'
 run(bun,'install','--frozen-lockfile',cwd=SOURCE)
 run(bun,'run','--cwd','electron','typecheck',cwd=SOURCE)
-run('node',SOURCE/'electron/node_modules/vitest/vitest.mjs','run','src/main/device-license.test.ts','src/main/device-activation.test.ts','src/renderer/src/lib/api/generate.test.ts','src/renderer/src/hooks/use-generate.test.tsx','src/renderer/src/lib/store/takes.test.ts','src/renderer/src/features/clone/script-panel.test.tsx',cwd=SOURCE/'electron')
+run('node',SOURCE/'electron/node_modules/vitest/vitest.mjs','run','src/renderer/src/features/clone/action-bar.test.tsx','src/main/device-license.test.ts','src/main/device-activation.test.ts','src/renderer/src/lib/api/generate.test.ts','src/renderer/src/hooks/use-generate.test.tsx','src/renderer/src/lib/store/takes.test.ts','src/renderer/src/features/clone/script-panel.test.tsx',cwd=SOURCE/'electron')
 run(bun,'run','--cwd','electron','build',cwd=SOURCE)
-for test in ['test_line_subtitles.py','test_line_subtitle_finalize.py','test_script_expression.py']:
+for test in ['test_line_subtitles.py','test_line_subtitle_finalize.py','test_script_expression.py','test_generation_control.py']:
  run(sys.executable,SOURCE/'tests'/test,'-v',cwd=SOURCE)
 installer=WORK/'official.exe'
 urllib.request.urlretrieve('https://github.com/debpalash/VoiceStudio/releases/download/v0.5.8/VoiceStudio-0.5.8-win-x64.exe',installer)
@@ -39,7 +39,7 @@ app_source=WORK/'app-source'
 run('node',asar,'extract',resources/'app.asar',app_source)
 shutil.rmtree(app_source/'out');shutil.copytree(SOURCE/'electron/out',app_source/'out')
 run('node',asar,'pack',app_source,resources/'app.asar')
-for relative in ['api/routers/generation.py','core/csrf.py','services/line_subtitles.py','services/script_expression.py']:
+for relative in ['api/routers/generation.py','core/csrf.py','services/line_subtitles.py','services/script_expression.py','services/generation_control.py']:
  shutil.copy2(SOURCE/'backend'/relative,resources/'backend'/relative)
 shutil.copy2(SOURCE/'config/app.json',resources/'config/app.json')
 shutil.copy2(SOURCE/'config/license-authority.json',resources/'config/license-authority.json')
