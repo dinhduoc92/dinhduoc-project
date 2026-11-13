@@ -43,20 +43,8 @@ try {
   let main;
   for(let n=0;n<60;n++){main=app.windows().find(w=>w!==page&&!w.isClosed());if(main)break;await new Promise(r=>setTimeout(r,500));}
   assert.ok(main,'Main window did not open after activation');
-  try {
-    await main.waitForFunction(()=>document.querySelector('#root')?.childElementCount>0,null,{timeout:8000});
-  } catch {
-    console.log('DIAGNOSTIC',await app.evaluate(({app,net})=>({root:app.getAppPath(),resources:process.resourcesPath})));
-    await app.evaluate(async ({app,protocol,net})=>{
-      const {createRequire}=process.getBuiltinModule('module');const require=createRequire(process.execPath);
-      const {pathToFileURL}=require('node:url');const {join}=require('node:path');
-      protocol.unhandle('app');
-      protocol.handle('app',request=>net.fetch(pathToFileURL(join(app.getAppPath(),'out','renderer',new URL(request.url).pathname)).toString()));
-    });
-    await main.reload();
-    await main.waitForFunction(()=>document.querySelector('#root')?.childElementCount>0,null,{timeout:15000});
-    throw new Error('DIAGNOSTIC: file URL handler restores rendering; apply production fix');
-  }
+  await main.waitForFunction(()=>document.querySelector('#root')?.childElementCount>0,null,{timeout:60000});
+  assert.match(await app.evaluate(({app})=>app.userAgentFallback), /^[\x20-\x7e]+$/);
   assert.deepEqual(uiErrors,[]);
   await main.screenshot({path:screenshot.replace('.png','-MAIN.png')});
   console.log('Native Windows main renderer mounted after activation.');

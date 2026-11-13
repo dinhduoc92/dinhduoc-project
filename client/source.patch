@@ -1147,7 +1147,7 @@ index 0000000..af7aae0
 +  }
 +}
 diff --git a/electron/src/main/index.ts b/electron/src/main/index.ts
-index 647381d..07463e9 100644
+index 647381d..3782006 100644
 --- a/electron/src/main/index.ts
 +++ b/electron/src/main/index.ts
 @@ -1,4 +1,6 @@
@@ -1169,17 +1169,13 @@ index 647381d..07463e9 100644
  registerAppScheme();
  
  const mainErrors = new MainErrorJournal(
-@@ -429,6 +436,18 @@ if (singleInstance && !app.requestSingleInstanceLock()) {
+@@ -429,6 +436,14 @@ if (singleInstance && !app.requestSingleInstanceLock()) {
      .whenReady()
      .then(async () => {
        electronApp.setAppUserModelId(APP_ID);
-+      // Register before the activation BrowserWindow creates the default network
-+      // context; late handlers can fail for renderer subresources on Windows.
-+      installAppProtocol(
-+        () => supervisor?.baseUrl ?? 'http://127.0.0.1:43900',
-+        RENDERER_DIR,
-+        () => supervisor?.requestHeaders() ?? {},
-+      );
++      // Electron derives its User-Agent from the localized product name. HTTP
++      // headers must be ASCII or protocol.handle rejects every subresource.
++      app.userAgentFallback = app.userAgentFallback.normalize('NFKD').replace(/[^\x20-\x7e]/g, '');
 +      const deviceLicense = await requireDeviceActivation(() => {
 +        app.relaunch();
 +        observeMainProcessTask(beginOrderlyQuit(false), mainErrors, 'Device license expired');
@@ -1188,20 +1184,15 @@ index 647381d..07463e9 100644
        if (app.isPackaged) {
          try {
            setUpTerminalCommand(
-@@ -458,11 +477,7 @@ if (singleInstance && !app.requestSingleInstanceLock()) {
+@@ -458,6 +473,7 @@ if (singleInstance && !app.requestSingleInstanceLock()) {
          console.log(`[supervisor] stage=${s.stage} managed=${s.managed} port=${s.port}${detail}`);
          publishDiscovery();
        });
--      installAppProtocol(
--        () => backend.baseUrl,
--        RENDERER_DIR,
--        () => backend.requestHeaders(),
--      );
 +
-       registerIpc(
-         backend,
-         () => mainWindow,
-@@ -515,11 +530,14 @@ if (singleInstance && !app.requestSingleInstanceLock()) {
+       installAppProtocol(
+         () => backend.baseUrl,
+         RENDERER_DIR,
+@@ -515,11 +531,14 @@ if (singleInstance && !app.requestSingleInstanceLock()) {
        );
        // 10 s after launch, then every 6 h; a failed check retries after 1 h,
        // doubling back to 6 h.
@@ -1221,7 +1212,7 @@ index 647381d..07463e9 100644
        checkForUpdates = () =>
          observeMainProcessTask(updater.check(false), mainErrors, 'Terminal update check');
        closeUpdates = () => {
-@@ -530,6 +548,7 @@ if (singleInstance && !app.requestSingleInstanceLock()) {
+@@ -530,6 +549,7 @@ if (singleInstance && !app.requestSingleInstanceLock()) {
          closeUpdateIpc();
        };
        if (!headlessOwner) mainWindow = createWindow();
