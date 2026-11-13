@@ -28,7 +28,7 @@ try {
   // Runner-only verifier stub: never modifies the packaged app or its trust keys.
   // Signature validation itself is covered separately with real RSA test keys.
   await app.evaluate(async () => {
-    const { createRequire, syncBuiltinESMExports } = await import('node:module');
+    const { createRequire, syncBuiltinESMExports } = process.getBuiltinModule('module');
     const require = createRequire(process.execPath);
     require('node:crypto').verify = () => true;
     syncBuiltinESMExports();
