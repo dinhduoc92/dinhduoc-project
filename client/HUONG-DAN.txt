@@ -49,3 +49,19 @@ Bản này nhận mã từ cả khóa máy ở nhà cd5595bf4155492c và máy c�
 chính tài khoản Windows đó. Không tạo lại khóa, không gửi khóa riêng cho ai.
 Mã cũ của máy ở nhà vẫn hợp lệ. Bạn bè cần dùng bản app mới này để nhận
 mã do máy công ty cấp; bản app cũ chỉ biết khóa máy ở nhà.
+
+THẺ BIỂU CẢM TRONG TXT
+Mỗi dòng một câu, ví dụ:
+[angry] Get out!
+[whispering] Stay quiet.
+Bật Audio + SRT. Thẻ chỉ dẫn không được đọc và không xuất hiện trong SRT.
+Các thẻ nhận diện: angry, shouting, choked-up, crying, sobbing, pleading,
+anxious, afraid, panicked, trembling, hesitant, stammering, sarcastic, mocking,
+arrogant, scornful, scoff, tongue-click, whispering, mumbling, gentle,
+reassuring, gasp, gulp (đặt trong ngoặc vuông). Thẻ áp dụng cho cả dòng.
+Không để thẻ riêng một dòng. App không tự chuyển cảm xúc sang dòng kế tiếp.
+OmniVoice không có điều khiển diễn đạt này: app bỏ thẻ và đọc lời thoại bình thường.
+Mô hình có hỗ trợ chỉ dẫn/điều khiển cảm xúc sẽ nhận hướng dẫn riêng.
+Đây không phải cam kết diễn đạt đúng mọi sắc thái, ngôn ngữ hay tạo tiếng động.
+Các tiếng chậc lưỡi, hít gấp, nuốt khan chưa có bộ tạo riêng và được bỏ qua;
+scoff được dùng làm gợi ý khinh miệt nếu mô hình hỗ trợ.

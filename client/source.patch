@@ -1,5 +1,5 @@
 diff --git a/backend/api/routers/generation.py b/backend/api/routers/generation.py
-index 0fd22e7..af4e817 100644
+index 0fd22e7..9b1eb7a 100644
 --- a/backend/api/routers/generation.py
 +++ b/backend/api/routers/generation.py
 @@ -1661,7 +1661,7 @@ async def _finalize_generation(
@@ -63,12 +63,19 @@ index 0fd22e7..af4e817 100644
  ):
      """Generate a voice take through the selected TTS engine.
  
-@@ -1951,6 +1967,13 @@ async def generate_speech(
+@@ -1951,6 +1967,20 @@ async def generate_speech(
      # (utils/duration.py) so the estimate and the synthesis see the same text.
      import unicodedata
      text = unicodedata.normalize("NFC", text)
 +    from services.line_subtitles import LineClock, script_lines
-+    caption_lines = script_lines(text) if subtitle_lines else []
++    from services.script_expression import has_directions, parse_line, caption_text, audio_text, render_line_call
++    if has_directions(text) and not subtitle_lines:
++        raise HTTPException(status_code=422, detail="Expression tags need Audio + SRT line mode. Enable it and keep each sentence on one line.")
++    source_lines = script_lines(text) if subtitle_lines else []
++    caption_lines = [caption_text(line) for line in source_lines]
++    line_directions = [parse_line(line)[1] for line in source_lines]
++    if any(not line for line in caption_lines):
++        raise HTTPException(status_code=422, detail="Each script line must contain spoken words, not only expression tags.")
 +    if subtitle_lines and (not caption_lines or duration is not None):
 +        raise HTTPException(status_code=422, detail="Line subtitles need non-empty text and automatic duration.")
 +    # Line mode returns a canonical WAV plus its sidecar, never an NDJSON preview.
@@ -77,17 +84,18 @@ index 0fd22e7..af4e817 100644
  
      # ── Engine resolution (issue #312) ──────────────────────────────────────
      # The request runs on the engine selected in Settings (POST /engines/select,
-@@ -2346,7 +2369,8 @@ async def generate_speech(
+@@ -2346,7 +2376,9 @@ async def generate_speech(
      # in services/text_normalization.py). Pref-gated (default ON), idempotent,
      # never raises; applied exactly once per request, at this choke point.
      from services.text_normalization import normalize_for_tts
 -    text = normalize_for_tts(text, language)
-+    text = ("\n".join(normalize_for_tts(line, language) for line in caption_lines)
++    spoken_lines = [audio_text(line, backend_cls) for line in source_lines]
++    text = ("\n".join(normalize_for_tts(line, language) for line in spoken_lines)
 +            if subtitle_lines else normalize_for_tts(text, language))
  
      # Expressive-TTS Spec 01: apply the user pronunciation dictionary + inline
      # [[…]] one-off overrides to the text, here — AFTER `language` is fully
-@@ -2363,15 +2387,18 @@ async def generate_speech(
+@@ -2363,15 +2395,18 @@ async def generate_speech(
              _pron_rows = load_entries_from_db()
          except Exception:  # noqa: BLE001 — table missing / DB locked → no-op
              _pron_rows = []
@@ -96,7 +104,7 @@ index 0fd22e7..af4e817 100644
 +        transform = lambda value: apply_pronunciation(
 +            value, _pron_rows, language, profile_id=resolved_profile_id,
          )
-+        render_lines = [transform(normalize_for_tts(line, language)) for line in caption_lines]
++        render_lines = [transform(normalize_for_tts(line, language)) for line in spoken_lines]
 +        text = "\n".join(render_lines) if subtitle_lines else transform(text)
      else:
          # Even with the dictionary off, inline [[…]] overrides are an explicit,
@@ -104,12 +112,12 @@ index 0fd22e7..af4e817 100644
          # double-bracket text the model would mispronounce).
          from services.pronunciation import apply_inline_overrides
 -        text = apply_inline_overrides(text)
-+        render_lines = [apply_inline_overrides(normalize_for_tts(line, language)) for line in caption_lines]
++        render_lines = [apply_inline_overrides(normalize_for_tts(line, language)) for line in spoken_lines]
 +        text = "\n".join(render_lines) if subtitle_lines else apply_inline_overrides(text)
  
      start_time = time.time()
  
-@@ -2765,24 +2792,48 @@ async def generate_speech(
+@@ -2765,24 +2800,49 @@ async def generate_speech(
                  class_temperature, used_seed, effect_preset,
                  max_chunk_chars, crossfade_ms, dropped_sink=_dropped_text,
              )
@@ -150,12 +158,13 @@ index 0fd22e7..af4e817 100644
 +        if line_clock is not None:
 +            import torch
 +            parts = []
-+            for line in render_lines:
++            for line_index, line in enumerate(render_lines):
 +                if not line.strip():
 +                    raise HTTPException(status_code=422, detail="A script line has no spoken text.")
-+                args = list(_local_render.args)
-+                args[1] = line
-+                render = functools.partial(_local_render.func, *args, **_local_render.keywords)
++                render = render_line_call(
++                    _local_render, line, line_directions[line_index], backend_cls,
++                    _backend is not None, emo_alpha,
++                )
 +                before_dropped = len(_dropped_text)
 +                part = await render_one(render)
 +                if len(_dropped_text) != before_dropped:
@@ -172,7 +181,7 @@ index 0fd22e7..af4e817 100644
          # Read after generation: engines with lazy model loading report
          # their real rate only once weights are up.
          sample_rate = (_backend.sample_rate if _backend is not None
-@@ -2795,6 +2846,8 @@ async def generate_speech(
+@@ -2795,6 +2855,8 @@ async def generate_speech(
              resolved_profile_id=resolved_profile_id, used_seed=used_seed,
              start_time=start_time, already_marked=False, wav_bits=int(wav_bits), include_wav_bytes=True,
              design_recipe=stored_design_recipe, engine_id=engine_id,
@@ -181,7 +190,7 @@ index 0fd22e7..af4e817 100644
          )
          audio_id = _meta["id"]
          audio_filename = _meta["filename"]
-@@ -2817,6 +2870,8 @@ async def generate_speech(
+@@ -2817,6 +2879,8 @@ async def generate_speech(
              "X-Audio-Duration": str(audio_dur),
              "Content-Length": str(len(wav_bytes)),
          }
@@ -190,7 +199,7 @@ index 0fd22e7..af4e817 100644
          # #1330: the body is a WAV, so the header channel carries the notice
          # that some of the text produced no audio. Count first (always exact),
          # then as much of the lost text as a header can safely hold.
-@@ -2914,6 +2969,8 @@ def _remove_deferred_wavs(paths) -> None:
+@@ -2914,6 +2978,8 @@ def _remove_deferred_wavs(paths) -> None:
      for p in paths:
          with contextlib.suppress(OSError):
              os.remove(p)
@@ -199,7 +208,7 @@ index 0fd22e7..af4e817 100644
  
  
  def _remove_wav_if_unreferenced(conn, audio_path, exclude_ids=(), defer=None):
-@@ -2945,6 +3002,8 @@ def _remove_wav_if_unreferenced(conn, audio_path, exclude_ids=(), defer=None):
+@@ -2945,6 +3011,8 @@ def _remove_wav_if_unreferenced(conn, audio_path, exclude_ids=(), defer=None):
          return
      with contextlib.suppress(OSError):
          os.remove(p)
@@ -208,7 +217,7 @@ index 0fd22e7..af4e817 100644
  
  
  # How many takes to keep before pruning the oldest UNstarred ones (rows + their
-@@ -3042,6 +3101,8 @@ def list_history():
+@@ -3042,6 +3110,8 @@ def list_history():
                  # What "save as voice" may use as the take's transcript; ""
                  # asks for the take's audio to be transcribed (#3062).
                  item["transcript"] = take_reference_transcript(item.get("text"))
@@ -285,6 +294,73 @@ index 0000000..c6f924c
 +        if not self.lines or len(self.cues) != len(self.lines):
 +            raise ValueError("Not all script lines have audio")
 +        return "\n".join(self.cues)
+diff --git a/backend/services/script_expression.py b/backend/services/script_expression.py
+new file mode 100644
+index 0000000..64ae3fe
+--- /dev/null
++++ b/backend/services/script_expression.py
+@@ -0,0 +1,61 @@
++"""Explicit script directions, never spoken words or subtitle text."""
++import functools
++import re
++
++DIRECTIONS = {
++    'angry': 'angry', 'shouting': 'shouting', 'choked-up': 'choked up, about to cry',
++    'crying': 'crying', 'sobbing': 'sobbing', 'pleading': 'pleading',
++    'anxious': 'anxious', 'afraid': 'afraid', 'panicked': 'panicked',
++    'trembling': 'with a trembling voice', 'hesitant': 'hesitant',
++    'stammering': 'stammering', 'sarcastic': 'sarcastic', 'mocking': 'mocking',
++    'arrogant': 'arrogant', 'scornful': 'scornful', 'scoff': 'scornful',
++    'tongue-click': '', 'whispering': 'whispering', 'mumbling': 'mumbling',
++    'gentle': 'gentle', 'reassuring': 'reassuring', 'gasp': '', 'gulp': '',
++}
++CUSTOM = re.compile(r'(?<!\[)\[(/?)(%s)\](?!\])' % '|'.join(map(re.escape, DIRECTIONS)), re.I)
++
++
++def has_directions(text):
++    return bool(CUSTOM.search(text))
++
++
++def parse_line(line):
++    directions = []
++    def remove(match):
++        direction = DIRECTIONS[match.group(2).lower()]
++        if not match.group(1) and direction and direction not in directions:
++            directions.append(direction)
++        return ''
++    return CUSTOM.sub(remove, line).strip(), ', '.join(directions)
++
++
++def caption_text(line):
++    from services.expression import OMNIVOICE_INLINE_TAGS, COSYVOICE_INLINE_TAGS
++    line = parse_line(line)[0]
++    for tag in set(OMNIVOICE_INLINE_TAGS + COSYVOICE_INLINE_TAGS):
++        line = re.sub(re.escape(tag), '', line, flags=re.I)
++    return line.strip()
++
++
++def audio_text(line, engine_cls):
++    from services.expression import OMNIVOICE_INLINE_TAGS, COSYVOICE_INLINE_TAGS
++    line = parse_line(line)[0]
++    supported = getattr(engine_cls, 'inline_tags', ())
++    for tag in set(OMNIVOICE_INLINE_TAGS + COSYVOICE_INLINE_TAGS):
++        if tag not in supported:
++            line = re.sub(re.escape(tag), '', line, flags=re.I)
++    return line.strip()
++
++
++def render_line_call(base, text, direction, engine_cls, pluggable, alpha=None):
++    from services.expression import apply_span_emotion
++    args = list(base.args)
++    args[1] = text
++    keywords = dict(base.keywords)
++    instruct_index = 5 if pluggable else 5
++    # Backend signature: backend, text, language, ref_audio, ref_text, instruct.
++    extra = dict(keywords.get('emotion_kwargs') or {})
++    args[instruct_index] = apply_span_emotion(engine_cls, extra, args[instruct_index], direction, alpha)
++    if pluggable:
++        keywords['emotion_kwargs'] = extra
++    return functools.partial(base.func, *args, **keywords)
 diff --git a/config/app.json b/config/app.json
 index 6475314..fd13dc1 100644
 --- a/config/app.json
@@ -2069,19 +2145,42 @@ index 87a85b8..3529f3a 100644
              />
              <Button
                variant="ghost"
+diff --git a/electron/src/renderer/src/features/clone/script-panel.test.tsx b/electron/src/renderer/src/features/clone/script-panel.test.tsx
+index 12a01da..cc2749b 100644
+--- a/electron/src/renderer/src/features/clone/script-panel.test.tsx
++++ b/electron/src/renderer/src/features/clone/script-panel.test.tsx
+@@ -28,6 +28,16 @@ vi.mock('@/lib/store/clone-settings', () => ({
+ }));
+ 
+ describe('ScriptPanel', () => {
++  it('inserts script directions and enables clean line subtitles', () => {
++    setCloneSetting.mockClear();
++    render(<ScriptPanel />);
++    const field=screen.getByRole('textbox', {name:'Script'}) as HTMLTextAreaElement;
++    field.focus();field.setSelectionRange(0,0);
++    fireEvent.click(screen.getByRole('button', {name:'Insert expression token'}));
++    fireEvent.click(screen.getByRole('menuitem', {name:'[whispering]'}));
++    expect(setCloneSetting).toHaveBeenCalledWith('subtitleLines',true);
++    expect(setCloneSetting).toHaveBeenCalledWith('text','[whispering] hello world');
++  });
+   it('grays out reaction tags the active engine would speak as words (#3422)', () => {
+     engine.tags = ['[sigh]'];
+     setCloneSetting.mockClear();
 diff --git a/electron/src/renderer/src/features/clone/script-panel.tsx b/electron/src/renderer/src/features/clone/script-panel.tsx
-index 3c2b68e..2b56c0f 100644
+index 3c2b68e..10dfacc 100644
 --- a/electron/src/renderer/src/features/clone/script-panel.tsx
 +++ b/electron/src/renderer/src/features/clone/script-panel.tsx
-@@ -20,6 +20,7 @@ import { KNOWN_TAGS, engineShortName, expressionCaps } from '@/lib/expression';
+@@ -20,6 +20,9 @@ import { KNOWN_TAGS, engineShortName, expressionCaps } from '@/lib/expression';
  import { setCloneSetting, useCloneSetting } from '@/lib/store/clone-settings';
  import { cn } from '@/lib/utils';
  import { SectionLabel } from './section-label';
 +import { useCloneScripts, setCloneScripts } from '@/lib/store/clone-scripts';
++
++const SCRIPT_DIRECTIONS = ["angry", "shouting", "choked-up", "crying", "sobbing", "pleading", "anxious", "afraid", "panicked", "trembling", "hesitant", "stammering", "sarcastic", "mocking", "arrogant", "scornful", "scoff", "tongue-click", "whispering", "mumbling", "gentle", "reassuring", "gasp", "gulp"];
  
  export function ScriptPanel({
    voiceName,
-@@ -28,6 +29,10 @@ export function ScriptPanel({
+@@ -28,6 +31,10 @@ export function ScriptPanel({
  }: { voiceName?: string; coachmark?: string; onUserEdit?: () => void } = {}) {
    const { t } = useTranslation();
    const text = useCloneSetting('text');
@@ -2092,7 +2191,7 @@ index 3c2b68e..2b56c0f 100644
    const { activeTts } = useEngines();
    // Offer the engine's own reaction tags; any other engine would speak them as words.
    const engineTags = expressionCaps(activeTts).tags;
-@@ -155,18 +160,41 @@ export function ScriptPanel({
+@@ -155,18 +162,41 @@ export function ScriptPanel({
              <input
                ref={importRef}
                type="file"
@@ -2138,7 +2237,20 @@ index 3c2b68e..2b56c0f 100644
                  } catch {
                    toast.error(t('scriptEdit.import_failed'));
                  } finally {
-@@ -352,6 +380,61 @@ export function ScriptPanel({
+@@ -310,6 +340,12 @@ export function ScriptPanel({
+                       aria-label={t('clone.insert_token')}
+                       className="fixed z-50 flex max-h-56 w-[min(360px,calc(100vw-16px))] flex-wrap gap-1 overflow-y-auto rounded-lg bg-popover p-2 text-popover-foreground shadow-md ring-1 ring-foreground/10 animate-in fade-in-0 zoom-in-95 motion-reduce:animate-none"
+                     >
++                      <p className="w-full px-2 text-xs text-muted-foreground">{t('expression.script_tags_note')}</p>
++                      {SCRIPT_DIRECTIONS.map(name => (
++                        <button key={name} type="button" role="menuitem" className="rounded-full px-2 py-0.5 text-xs hover:bg-muted" onClick={() => { setCloneSetting('subtitleLines', true); edit(`[${name}] `); }}>
++                          {`[${name}]`}
++                        </button>
++                      ))}
+                       {[...engineTags, ...unsupportedTags].map((tag) => {
+                         const supported = engineTags.includes(tag);
+                         return (
+@@ -352,6 +388,61 @@ export function ScriptPanel({
              <span>{coachmark}</span>
            </div>
          ) : null}
@@ -2939,7 +3051,7 @@ index a1a9f04..f44f24f 100644
      progress,
      stage,
 diff --git a/electron/src/renderer/src/i18n/locales/ar.json b/electron/src/renderer/src/i18n/locales/ar.json
-index a262f27..b1a6044 100644
+index a262f27..9a37957 100644
 --- a/electron/src/renderer/src/i18n/locales/ar.json
 +++ b/electron/src/renderer/src/i18n/locales/ar.json
 @@ -1,4 +1,20 @@
@@ -2963,7 +3075,17 @@ index a262f27..b1a6044 100644
    "cloneEmotion": {
      "title": "العاطفة",
      "off": "إيقاف",
-@@ -573,6 +589,13 @@
+@@ -21,7 +37,8 @@
+     "tags_hint": "للحظات داخل السطر، أضف تفاعلات مثل {{example}} من «إدراج» في النص.",
+     "tags_unsupported": "سيقرأ {{engine}} الوسوم الرمادية بصوت عالٍ ككلمات.",
+     "guide": "دليل الكلام التعبيري",
+-    "tip": "تلميح: شكّل الأداء باستخدام «العاطفة» أدناه، وأضف تفاعلات مثل الضحك أو التنهد من «إدراج» في النص."
++    "tip": "تلميح: شكّل الأداء باستخدام «العاطفة» أدناه، وأضف تفاعلات مثل الضحك أو التنهد من «إدراج» في النص.",
++    "script_tags_note": "Script directions: never spoken or shown in SRT. Requires Audio + SRT, one sentence per line. Emotion depends on the model; unsupported directions and sound effects are omitted."
+   },
+   "cloneQuality": {
+     "title": "جودة الصوت",
+@@ -573,6 +590,13 @@
      "working": "جارٍ العمل…"
    },
    "clone": {
@@ -2977,7 +3099,7 @@ index a262f27..b1a6044 100644
      "text_label": "النص",
      "paste": "لصق",
      "paste_failed": "تم حظر الوصول إلى الحافظة. الصق مباشرة في حقل النص باستخدام لوحة المفاتيح.",
-@@ -1905,7 +1928,7 @@
+@@ -1905,7 +1929,7 @@
      "toast_flushed": "متدفق — ذاكرة الوصول العشوائي {{ram}}G · VRAM {{vram}}G{{unloaded}}",
      "toast_model_unloaded": "· تم تفريغ النموذج",
      "toast_flush_failed": "فشل التدفق: {{message}}",
@@ -2987,7 +3109,7 @@ index a262f27..b1a6044 100644
      "version_dev": "v{{version}} · تطوير",
      "tagline": "استنساخ الصوت المحلي. لا شيء يترك جهازك.",
 diff --git a/electron/src/renderer/src/i18n/locales/de.json b/electron/src/renderer/src/i18n/locales/de.json
-index fa7ec48..509136a 100644
+index fa7ec48..709c499 100644
 --- a/electron/src/renderer/src/i18n/locales/de.json
 +++ b/electron/src/renderer/src/i18n/locales/de.json
 @@ -1,4 +1,20 @@
@@ -3011,7 +3133,17 @@ index fa7ec48..509136a 100644
    "cloneEmotion": {
      "title": "Emotion",
      "off": "Aus",
-@@ -553,6 +569,13 @@
+@@ -21,7 +37,8 @@
+     "tags_hint": "Für Momente innerhalb einer Zeile fügen Sie Reaktionen wie {{example}} über „Einfügen“ im Skript hinzu.",
+     "tags_unsupported": "Ausgegraute Tags würde {{engine}} als Wörter vorlesen.",
+     "guide": "Leitfaden für ausdrucksstarke Sprache",
+-    "tip": "Tipp: Gestalten Sie den Vortrag unten mit „Emotion“ und fügen Sie über „Einfügen“ im Skript Reaktionen wie Lachen oder Seufzen hinzu."
++    "tip": "Tipp: Gestalten Sie den Vortrag unten mit „Emotion“ und fügen Sie über „Einfügen“ im Skript Reaktionen wie Lachen oder Seufzen hinzu.",
++    "script_tags_note": "Script directions: never spoken or shown in SRT. Requires Audio + SRT, one sentence per line. Emotion depends on the model; unsupported directions and sound effects are omitted."
+   },
+   "cloneQuality": {
+     "title": "Audioqualität",
+@@ -553,6 +570,13 @@
      "working": "Wird verarbeitet…"
    },
    "clone": {
@@ -3025,7 +3157,7 @@ index fa7ec48..509136a 100644
      "text_label": "Text",
      "paste": "Einfügen",
      "paste_failed": "Der Zugriff auf die Zwischenablage wurde blockiert. Füge den Inhalt mit der Tastatur direkt ins Textfeld ein.",
-@@ -1877,7 +1900,7 @@
+@@ -1877,7 +1901,7 @@
      "toast_flushed": "Gespült – RAM {{ram}}G · VRAM {{vram}}G{{unloaded}}",
      "toast_model_unloaded": "· Modell entladen",
      "toast_flush_failed": "Spülung fehlgeschlagen: {{message}}",
@@ -3035,7 +3167,7 @@ index fa7ec48..509136a 100644
      "version_dev": "v{{version}} · Entwicklung",
      "tagline": "Klonen lokaler Stimmen. Nichts verlässt Ihre Maschine.",
 diff --git a/electron/src/renderer/src/i18n/locales/en.json b/electron/src/renderer/src/i18n/locales/en.json
-index 3bff2b4..dfabfe5 100644
+index 3bff2b4..ce49e0f 100644
 --- a/electron/src/renderer/src/i18n/locales/en.json
 +++ b/electron/src/renderer/src/i18n/locales/en.json
 @@ -1,4 +1,20 @@
@@ -3059,7 +3191,17 @@ index 3bff2b4..dfabfe5 100644
    "cloneEmotion": {
      "title": "Emotion",
      "off": "Off",
-@@ -327,7 +343,7 @@
+@@ -21,7 +37,8 @@
+     "tags_hint": "For moments within a line, add reactions such as {{example}} from Insert in the script.",
+     "tags_unsupported": "Grayed tags would be read aloud as words by {{engine}}.",
+     "guide": "Expressive speech guide",
+-    "tip": "Tip: shape the delivery with Emotion below, and add reactions such as laughs or sighs from Insert in the script."
++    "tip": "Tip: shape the delivery with Emotion below, and add reactions such as laughs or sighs from Insert in the script.",
++    "script_tags_note": "Script directions: never spoken or shown in SRT. Requires Audio + SRT, one sentence per line. Emotion depends on the model; unsupported directions and sound effects are omitted."
+   },
+   "cloneQuality": {
+     "title": "Audio quality",
+@@ -327,7 +344,7 @@
      "voice_note": "A voice's own entries win over the language dictionary whenever that voice speaks."
    },
    "app": {
@@ -3068,7 +3210,7 @@ index 3bff2b4..dfabfe5 100644
      "tagline": "Open source voice cloning and workflow engine. Build local.",
      "coming_soon": "Coming soon",
      "version": "v{{version}}",
-@@ -475,6 +491,13 @@
+@@ -475,6 +492,13 @@
      "selfTestUnreachable": "Couldn't run the self-test. Check that VoiceStudio is still running, then try again."
    },
    "clone": {
@@ -3083,7 +3225,7 @@ index 3bff2b4..dfabfe5 100644
      "text_label": "Script",
      "paste": "Paste",
 diff --git a/electron/src/renderer/src/i18n/locales/es.json b/electron/src/renderer/src/i18n/locales/es.json
-index d9fe624..af1d536 100644
+index d9fe624..e94f786 100644
 --- a/electron/src/renderer/src/i18n/locales/es.json
 +++ b/electron/src/renderer/src/i18n/locales/es.json
 @@ -1,4 +1,20 @@
@@ -3107,7 +3249,17 @@ index d9fe624..af1d536 100644
    "cloneEmotion": {
      "title": "Emoción",
      "off": "Desactivado",
-@@ -555,6 +571,13 @@
+@@ -21,7 +37,8 @@
+     "tags_hint": "Para momentos dentro de una línea, añade reacciones como {{example}} desde Insertar en el guion.",
+     "tags_unsupported": "{{engine}} leería en voz alta como palabras las etiquetas en gris.",
+     "guide": "Guía de voz expresiva",
+-    "tip": "Consejo: da forma a la interpretación con Emoción, abajo, y añade reacciones como risas o suspiros desde Insertar en el guion."
++    "tip": "Consejo: da forma a la interpretación con Emoción, abajo, y añade reacciones como risas o suspiros desde Insertar en el guion.",
++    "script_tags_note": "Script directions: never spoken or shown in SRT. Requires Audio + SRT, one sentence per line. Emotion depends on the model; unsupported directions and sound effects are omitted."
+   },
+   "cloneQuality": {
+     "title": "Calidad de audio",
+@@ -555,6 +572,13 @@
      "working": "Procesando…"
    },
    "clone": {
@@ -3121,7 +3273,7 @@ index d9fe624..af1d536 100644
      "text_label": "Texto",
      "paste": "Pegar",
      "paste_failed": "Se bloqueó el acceso al portapapeles. Pega directamente en el campo de texto con el teclado.",
-@@ -1879,7 +1902,7 @@
+@@ -1879,7 +1903,7 @@
      "toast_flushed": "Vaciado — RAM {{ram}}G · VRAM {{vram}}G{{unloaded}}",
      "toast_model_unloaded": "· modelo descargado",
      "toast_flush_failed": "Error de descarga: {{message}}",
@@ -3131,7 +3283,7 @@ index d9fe624..af1d536 100644
      "version_dev": "v{{version}} · Desarrollo",
      "tagline": "Clonación de voz local. Nada sale de tu máquina.",
 diff --git a/electron/src/renderer/src/i18n/locales/fr.json b/electron/src/renderer/src/i18n/locales/fr.json
-index 58671a8..18e7863 100644
+index 58671a8..ca378c1 100644
 --- a/electron/src/renderer/src/i18n/locales/fr.json
 +++ b/electron/src/renderer/src/i18n/locales/fr.json
 @@ -1,4 +1,20 @@
@@ -3155,7 +3307,17 @@ index 58671a8..18e7863 100644
    "cloneEmotion": {
      "title": "Émotion",
      "off": "Désactivé",
-@@ -555,6 +571,13 @@
+@@ -21,7 +37,8 @@
+     "tags_hint": "Pour un moment précis dans une ligne, ajoutez des réactions comme {{example}} via Insérer dans le script.",
+     "tags_unsupported": "{{engine}} lirait les balises grisées à voix haute comme des mots.",
+     "guide": "Guide de la voix expressive",
+-    "tip": "Astuce : façonnez le jeu avec Émotion ci-dessous et ajoutez des réactions comme des rires ou des soupirs via Insérer dans le script."
++    "tip": "Astuce : façonnez le jeu avec Émotion ci-dessous et ajoutez des réactions comme des rires ou des soupirs via Insérer dans le script.",
++    "script_tags_note": "Script directions: never spoken or shown in SRT. Requires Audio + SRT, one sentence per line. Emotion depends on the model; unsupported directions and sound effects are omitted."
+   },
+   "cloneQuality": {
+     "title": "Qualité audio",
+@@ -555,6 +572,13 @@
      "working": "Traitement en cours…"
    },
    "clone": {
@@ -3169,7 +3331,7 @@ index 58671a8..18e7863 100644
      "text_label": "Texte",
      "paste": "Coller",
      "paste_failed": "L’accès au presse-papiers est bloqué. Collez directement dans le champ de texte avec le clavier.",
-@@ -1879,7 +1902,7 @@
+@@ -1879,7 +1903,7 @@
      "toast_flushed": "Vidé — RAM {{ram}}G · VRAM {{vram}}G{{unloaded}}",
      "toast_model_unloaded": "· modèle déchargé",
      "toast_flush_failed": "Échec du rinçage : {{message}}",
@@ -3179,7 +3341,7 @@ index 58671a8..18e7863 100644
      "version_dev": "v{{version}} · Développement",
      "tagline": "Clonage de voix locale. Rien ne quitte votre machine.",
 diff --git a/electron/src/renderer/src/i18n/locales/gl.json b/electron/src/renderer/src/i18n/locales/gl.json
-index 1584ca4..ab42fa4 100644
+index 1584ca4..cd5b03e 100644
 --- a/electron/src/renderer/src/i18n/locales/gl.json
 +++ b/electron/src/renderer/src/i18n/locales/gl.json
 @@ -1,4 +1,20 @@
@@ -3203,7 +3365,17 @@ index 1584ca4..ab42fa4 100644
    "cloneEmotion": {
      "title": "Emoción",
      "off": "Desactivado",
-@@ -327,7 +343,7 @@
+@@ -21,7 +37,8 @@
+     "tags_hint": "Para momentos dentro dunha liña, engade reaccións como {{example}} desde Inserir no guión.",
+     "tags_unsupported": "{{engine}} lería en voz alta como palabras as etiquetas en gris.",
+     "guide": "Guía de voz expresiva",
+-    "tip": "Consello: dálle forma á interpretación con Emoción, abaixo, e engade reaccións como risos ou suspiros desde Inserir no guión."
++    "tip": "Consello: dálle forma á interpretación con Emoción, abaixo, e engade reaccións como risos ou suspiros desde Inserir no guión.",
++    "script_tags_note": "Script directions: never spoken or shown in SRT. Requires Audio + SRT, one sentence per line. Emotion depends on the model; unsupported directions and sound effects are omitted."
+   },
+   "cloneQuality": {
+     "title": "Calidade de audio",
+@@ -327,7 +344,7 @@
      "voice_note": "As entradas propias dunha voz teñen prioridade sobre o dicionario do idioma cando esa voz fala."
    },
    "app": {
@@ -3212,7 +3384,7 @@ index 1584ca4..ab42fa4 100644
      "tagline": "Clonación de voz de código aberto e motor de fluxo de traballo. Construír local.",
      "coming_soon": "Próximamente",
      "version": "v{{version}}",
-@@ -475,6 +491,13 @@
+@@ -475,6 +492,13 @@
      "selfTestUnreachable": "Non se puido executar a autoproba. Comproba que VoiceStudio segue en marcha e téntao de novo."
    },
    "clone": {
@@ -3227,7 +3399,7 @@ index 1584ca4..ab42fa4 100644
      "text_label": "Guión",
      "paste": "Pegar",
 diff --git a/electron/src/renderer/src/i18n/locales/hi.json b/electron/src/renderer/src/i18n/locales/hi.json
-index 9e76498..78f22ff 100644
+index 9e76498..8f8dc5c 100644
 --- a/electron/src/renderer/src/i18n/locales/hi.json
 +++ b/electron/src/renderer/src/i18n/locales/hi.json
 @@ -1,4 +1,20 @@
@@ -3251,7 +3423,17 @@ index 9e76498..78f22ff 100644
    "cloneEmotion": {
      "title": "भावना",
      "off": "बंद",
-@@ -553,6 +569,13 @@
+@@ -21,7 +37,8 @@
+     "tags_hint": "किसी पंक्ति के भीतर के पलों के लिए, स्क्रिप्ट में डालें से {{example}} जैसी प्रतिक्रियाएँ जोड़ें।",
+     "tags_unsupported": "धूसर टैग को {{engine}} शब्दों की तरह ज़ोर से पढ़ेगा।",
+     "guide": "अभिव्यंजक भाषण गाइड",
+-    "tip": "सुझाव: नीचे भावना से प्रस्तुति को आकार दें, और स्क्रिप्ट में डालें से हँसी या आह जैसी प्रतिक्रियाएँ जोड़ें।"
++    "tip": "सुझाव: नीचे भावना से प्रस्तुति को आकार दें, और स्क्रिप्ट में डालें से हँसी या आह जैसी प्रतिक्रियाएँ जोड़ें।",
++    "script_tags_note": "Script directions: never spoken or shown in SRT. Requires Audio + SRT, one sentence per line. Emotion depends on the model; unsupported directions and sound effects are omitted."
+   },
+   "cloneQuality": {
+     "title": "ऑडियो गुणवत्ता",
+@@ -553,6 +570,13 @@
      "working": "कार्य जारी है…"
    },
    "clone": {
@@ -3265,7 +3447,7 @@ index 9e76498..78f22ff 100644
      "text_label": "पाठ",
      "paste": "चिपकाएँ",
      "paste_failed": "क्लिपबोर्ड का उपयोग अवरुद्ध है। कीबोर्ड से सीधे पाठ फ़ील्ड में चिपकाएँ।",
-@@ -1877,7 +1900,7 @@
+@@ -1877,7 +1901,7 @@
      "toast_flushed": "फ्लश - RAM {{ram}}G · VRAM {{vram}}G{{unloaded}}",
      "toast_model_unloaded": "· मॉडल उतार दिया गया",
      "toast_flush_failed": "फ्लश विफल: {{message}}",
@@ -3275,7 +3457,7 @@ index 9e76498..78f22ff 100644
      "version_dev": "v{{version}} · डेवलपमेंट",
      "tagline": "स्थानीय आवाज क्लोनिंग. आपकी मशीन से कुछ भी नहीं छूटता.",
 diff --git a/electron/src/renderer/src/i18n/locales/id.json b/electron/src/renderer/src/i18n/locales/id.json
-index 3177154..38d8cc6 100644
+index 3177154..53a19e0 100644
 --- a/electron/src/renderer/src/i18n/locales/id.json
 +++ b/electron/src/renderer/src/i18n/locales/id.json
 @@ -1,4 +1,20 @@
@@ -3299,7 +3481,17 @@ index 3177154..38d8cc6 100644
    "cloneEmotion": {
      "title": "Emosi",
      "off": "Nonaktif",
-@@ -553,6 +569,13 @@
+@@ -21,7 +37,8 @@
+     "tags_hint": "Untuk momen di dalam satu baris, tambahkan reaksi seperti {{example}} dari Sisipkan di skrip.",
+     "tags_unsupported": "Tag berwarna abu-abu akan dibacakan sebagai kata oleh {{engine}}.",
+     "guide": "Panduan ucapan ekspresif",
+-    "tip": "Tips: bentuk penyampaian dengan Emosi di bawah, dan tambahkan reaksi seperti tawa atau desahan dari Sisipkan di skrip."
++    "tip": "Tips: bentuk penyampaian dengan Emosi di bawah, dan tambahkan reaksi seperti tawa atau desahan dari Sisipkan di skrip.",
++    "script_tags_note": "Script directions: never spoken or shown in SRT. Requires Audio + SRT, one sentence per line. Emotion depends on the model; unsupported directions and sound effects are omitted."
+   },
+   "cloneQuality": {
+     "title": "Kualitas audio",
+@@ -553,6 +570,13 @@
      "working": "Memproses…"
    },
    "clone": {
@@ -3313,7 +3505,7 @@ index 3177154..38d8cc6 100644
      "text_label": "Teks",
      "paste": "Tempel",
      "paste_failed": "Akses papan klip diblokir. Tempel langsung ke kolom teks menggunakan papan ketik.",
-@@ -1877,7 +1900,7 @@
+@@ -1877,7 +1901,7 @@
      "toast_flushed": "Dibilas — RAM {{ram}}G · VRAM {{vram}}G{{unloaded}}",
      "toast_model_unloaded": "· model dibongkar",
      "toast_flush_failed": "Gagal menyiram: {{message}}",
@@ -3323,7 +3515,7 @@ index 3177154..38d8cc6 100644
      "version_dev": "v{{version}} · Pengembangan",
      "tagline": "Kloning suara lokal. Tidak ada yang meninggalkan mesin Anda.",
 diff --git a/electron/src/renderer/src/i18n/locales/it.json b/electron/src/renderer/src/i18n/locales/it.json
-index e3392fe..0cb539f 100644
+index e3392fe..f95fbe0 100644
 --- a/electron/src/renderer/src/i18n/locales/it.json
 +++ b/electron/src/renderer/src/i18n/locales/it.json
 @@ -1,4 +1,20 @@
@@ -3347,7 +3539,17 @@ index e3392fe..0cb539f 100644
    "cloneEmotion": {
      "title": "Emozione",
      "off": "Disattivato",
-@@ -555,6 +571,13 @@
+@@ -21,7 +37,8 @@
+     "tags_hint": "Per momenti all’interno di una riga, aggiungi reazioni come {{example}} da Inserisci nel copione.",
+     "tags_unsupported": "{{engine}} leggerebbe ad alta voce come parole i tag in grigio.",
+     "guide": "Guida al parlato espressivo",
+-    "tip": "Suggerimento: modella l’interpretazione con Emozione qui sotto e aggiungi reazioni come risate o sospiri da Inserisci nel copione."
++    "tip": "Suggerimento: modella l’interpretazione con Emozione qui sotto e aggiungi reazioni come risate o sospiri da Inserisci nel copione.",
++    "script_tags_note": "Script directions: never spoken or shown in SRT. Requires Audio + SRT, one sentence per line. Emotion depends on the model; unsupported directions and sound effects are omitted."
+   },
+   "cloneQuality": {
+     "title": "Qualità audio",
+@@ -555,6 +572,13 @@
      "working": "Elaborazione…"
    },
    "clone": {
@@ -3361,7 +3563,7 @@ index e3392fe..0cb539f 100644
      "text_label": "Testo",
      "paste": "Incolla",
      "paste_failed": "L’accesso agli appunti è bloccato. Incolla direttamente nel campo di testo con la tastiera.",
-@@ -1879,7 +1902,7 @@
+@@ -1879,7 +1903,7 @@
      "toast_flushed": "Scaricato — RAM {{ram}}G · VRAM {{vram}}G{{unloaded}}",
      "toast_model_unloaded": "· modello scarico",
      "toast_flush_failed": "Eliminazione non riuscita: {{message}}",
@@ -3371,7 +3573,7 @@ index e3392fe..0cb539f 100644
      "version_dev": "v{{version}} · Sviluppo",
      "tagline": "Clonazione vocale locale. Niente lascia la tua macchina.",
 diff --git a/electron/src/renderer/src/i18n/locales/ja.json b/electron/src/renderer/src/i18n/locales/ja.json
-index a1f574a..7e87803 100644
+index a1f574a..fd1167c 100644
 --- a/electron/src/renderer/src/i18n/locales/ja.json
 +++ b/electron/src/renderer/src/i18n/locales/ja.json
 @@ -1,4 +1,20 @@
@@ -3395,7 +3597,17 @@ index a1f574a..7e87803 100644
    "cloneEmotion": {
      "title": "感情",
      "off": "オフ",
-@@ -553,6 +569,13 @@
+@@ -21,7 +37,8 @@
+     "tags_hint": "行の途中の瞬間には、スクリプトの「挿入」から {{example}} などのリアクションを追加してください。",
+     "tags_unsupported": "グレーのタグは {{engine}} が単語として読み上げてしまいます。",
+     "guide": "表現豊かな音声ガイド",
+-    "tip": "ヒント：下の「感情」で話し方を調整し、スクリプトの「挿入」から笑い声やため息などのリアクションを追加できます。"
++    "tip": "ヒント：下の「感情」で話し方を調整し、スクリプトの「挿入」から笑い声やため息などのリアクションを追加できます。",
++    "script_tags_note": "Script directions: never spoken or shown in SRT. Requires Audio + SRT, one sentence per line. Emotion depends on the model; unsupported directions and sound effects are omitted."
+   },
+   "cloneQuality": {
+     "title": "音声品質",
+@@ -553,6 +570,13 @@
      "working": "処理中…"
    },
    "clone": {
@@ -3409,7 +3621,7 @@ index a1f574a..7e87803 100644
      "text_label": "テキスト",
      "paste": "貼り付け",
      "paste_failed": "クリップボードへのアクセスが拒否されました。キーボードでテキスト欄に直接貼り付けてください。",
-@@ -1877,7 +1900,7 @@
+@@ -1877,7 +1901,7 @@
      "toast_flushed": "フラッシュ — RAM {{ram}}G · VRAM {{vram}}G{{unloaded}}",
      "toast_model_unloaded": "· モデルがアンロードされました",
      "toast_flush_failed": "フラッシュに失敗しました: {{message}}",
@@ -3419,7 +3631,7 @@ index a1f574a..7e87803 100644
      "version_dev": "v{{version}} · 開発",
      "tagline": "ローカル音声のクローン作成。マシンからは何も残りません。",
 diff --git a/electron/src/renderer/src/i18n/locales/ko.json b/electron/src/renderer/src/i18n/locales/ko.json
-index 1354233..6daf9d8 100644
+index 1354233..067090c 100644
 --- a/electron/src/renderer/src/i18n/locales/ko.json
 +++ b/electron/src/renderer/src/i18n/locales/ko.json
 @@ -1,4 +1,20 @@
@@ -3443,7 +3655,17 @@ index 1354233..6daf9d8 100644
    "cloneEmotion": {
      "title": "감정",
      "off": "끄기",
-@@ -553,6 +569,13 @@
+@@ -21,7 +37,8 @@
+     "tags_hint": "줄 안의 특정 순간에는 스크립트의 삽입에서 {{example}} 같은 리액션을 추가하세요.",
+     "tags_unsupported": "회색 태그는 {{engine}}이(가) 단어로 소리 내어 읽습니다.",
+     "guide": "표현력 있는 음성 가이드",
+-    "tip": "팁: 아래 감정으로 전달 방식을 조절하고, 스크립트의 삽입에서 웃음이나 한숨 같은 리액션을 추가하세요."
++    "tip": "팁: 아래 감정으로 전달 방식을 조절하고, 스크립트의 삽입에서 웃음이나 한숨 같은 리액션을 추가하세요.",
++    "script_tags_note": "Script directions: never spoken or shown in SRT. Requires Audio + SRT, one sentence per line. Emotion depends on the model; unsupported directions and sound effects are omitted."
+   },
+   "cloneQuality": {
+     "title": "오디오 품질",
+@@ -553,6 +570,13 @@
      "working": "처리 중…"
    },
    "clone": {
@@ -3457,7 +3679,7 @@ index 1354233..6daf9d8 100644
      "text_label": "텍스트",
      "paste": "붙여넣기",
      "paste_failed": "클립보드 접근이 차단되었습니다. 키보드로 텍스트 입력란에 직접 붙여넣으세요.",
-@@ -1877,7 +1900,7 @@
+@@ -1877,7 +1901,7 @@
      "toast_flushed": "플러시 — RAM {{ram}}G · VRAM {{vram}}G{{unloaded}}",
      "toast_model_unloaded": "· 모델 언로드됨",
      "toast_flush_failed": "플러시 실패: {{message}}",
@@ -3467,7 +3689,7 @@ index 1354233..6daf9d8 100644
      "version_dev": "v{{version}} · 개발",
      "tagline": "로컬 음성 복제. 당신의 기계에는 아무것도 남지 않습니다.",
 diff --git a/electron/src/renderer/src/i18n/locales/nl.json b/electron/src/renderer/src/i18n/locales/nl.json
-index 7e5b393..b73d702 100644
+index 7e5b393..861c5d9 100644
 --- a/electron/src/renderer/src/i18n/locales/nl.json
 +++ b/electron/src/renderer/src/i18n/locales/nl.json
 @@ -1,4 +1,20 @@
@@ -3491,7 +3713,17 @@ index 7e5b393..b73d702 100644
    "cloneEmotion": {
      "title": "Emotie",
      "off": "Uit",
-@@ -553,6 +569,13 @@
+@@ -21,7 +37,8 @@
+     "tags_hint": "Voor momenten binnen een regel voeg je reacties zoals {{example}} toe via Invoegen in het script.",
+     "tags_unsupported": "Grijze tags zou {{engine}} hardop als woorden voorlezen.",
+     "guide": "Gids voor expressieve spraak",
+-    "tip": "Tip: geef de voordracht vorm met Emotie hieronder en voeg reacties zoals lachen of zuchten toe via Invoegen in het script."
++    "tip": "Tip: geef de voordracht vorm met Emotie hieronder en voeg reacties zoals lachen of zuchten toe via Invoegen in het script.",
++    "script_tags_note": "Script directions: never spoken or shown in SRT. Requires Audio + SRT, one sentence per line. Emotion depends on the model; unsupported directions and sound effects are omitted."
+   },
+   "cloneQuality": {
+     "title": "Audiokwaliteit",
+@@ -553,6 +570,13 @@
      "working": "Verwerken…"
    },
    "clone": {
@@ -3505,7 +3737,7 @@ index 7e5b393..b73d702 100644
      "text_label": "Tekst",
      "paste": "Plakken",
      "paste_failed": "Toegang tot het klembord is geblokkeerd. Plak rechtstreeks in het tekstveld met het toetsenbord.",
-@@ -1877,7 +1900,7 @@
+@@ -1877,7 +1901,7 @@
      "toast_flushed": "Gespoeld — RAM {{ram}}G · VRAM {{vram}}G{{unloaded}}",
      "toast_model_unloaded": "· model onbeladen",
      "toast_flush_failed": "Spoelen mislukt: {{message}}",
@@ -3515,7 +3747,7 @@ index 7e5b393..b73d702 100644
      "version_dev": "v{{version}} · Ontwikkeling",
      "tagline": "Lokaal stemklonen. Niets verlaat uw machine.",
 diff --git a/electron/src/renderer/src/i18n/locales/pl.json b/electron/src/renderer/src/i18n/locales/pl.json
-index 740d4fa..4cea9f6 100644
+index 740d4fa..7f854fb 100644
 --- a/electron/src/renderer/src/i18n/locales/pl.json
 +++ b/electron/src/renderer/src/i18n/locales/pl.json
 @@ -1,4 +1,20 @@
@@ -3539,7 +3771,17 @@ index 740d4fa..4cea9f6 100644
    "cloneEmotion": {
      "title": "Emocje",
      "off": "Wyłączone",
-@@ -563,6 +579,13 @@
+@@ -21,7 +37,8 @@
+     "tags_hint": "Aby dodać moment w obrębie wiersza, wstaw reakcje takie jak {{example}} przez Wstaw w skrypcie.",
+     "tags_unsupported": "Szare tagi {{engine}} przeczyta na głos jako słowa.",
+     "guide": "Przewodnik po ekspresyjnej mowie",
+-    "tip": "Wskazówka: kształtuj interpretację za pomocą przycisku Emocje poniżej i dodawaj reakcje, takie jak śmiech czy westchnienie, przez Wstaw w skrypcie."
++    "tip": "Wskazówka: kształtuj interpretację za pomocą przycisku Emocje poniżej i dodawaj reakcje, takie jak śmiech czy westchnienie, przez Wstaw w skrypcie.",
++    "script_tags_note": "Script directions: never spoken or shown in SRT. Requires Audio + SRT, one sentence per line. Emotion depends on the model; unsupported directions and sound effects are omitted."
+   },
+   "cloneQuality": {
+     "title": "Jakość dźwięku",
+@@ -563,6 +580,13 @@
      "working": "Przetwarzanie…"
    },
    "clone": {
@@ -3553,7 +3795,7 @@ index 740d4fa..4cea9f6 100644
      "text_label": "Tekst",
      "paste": "Wklej",
      "paste_failed": "Dostęp do schowka został zablokowany. Wklej bezpośrednio do pola tekstowego za pomocą klawiatury.",
-@@ -1891,7 +1914,7 @@
+@@ -1891,7 +1915,7 @@
      "toast_flushed": "Opróżniony — RAM {{ram}}G · VRAM {{vram}}G{{unloaded}}",
      "toast_model_unloaded": "· model rozładowany",
      "toast_flush_failed": "Spłukiwanie nie powiodło się: {{message}}",
@@ -3563,7 +3805,7 @@ index 740d4fa..4cea9f6 100644
      "version_dev": "v{{version}} · Deweloperska",
      "tagline": "Lokalne klonowanie głosu. Nic nie opuszcza Twojej maszyny.",
 diff --git a/electron/src/renderer/src/i18n/locales/pt.json b/electron/src/renderer/src/i18n/locales/pt.json
-index 41544d5..2f4b0f4 100644
+index 41544d5..bf449d0 100644
 --- a/electron/src/renderer/src/i18n/locales/pt.json
 +++ b/electron/src/renderer/src/i18n/locales/pt.json
 @@ -1,4 +1,20 @@
@@ -3587,7 +3829,17 @@ index 41544d5..2f4b0f4 100644
    "cloneEmotion": {
      "title": "Emoção",
      "off": "Desativado",
-@@ -555,6 +571,13 @@
+@@ -21,7 +37,8 @@
+     "tags_hint": "Para momentos dentro de uma linha, adicione reações como {{example}} em Inserir no roteiro.",
+     "tags_unsupported": "As tags em cinza seriam lidas em voz alta como palavras por {{engine}}.",
+     "guide": "Guia de fala expressiva",
+-    "tip": "Dica: molde a interpretação com Emoção abaixo e adicione reações como risadas ou suspiros em Inserir no roteiro."
++    "tip": "Dica: molde a interpretação com Emoção abaixo e adicione reações como risadas ou suspiros em Inserir no roteiro.",
++    "script_tags_note": "Script directions: never spoken or shown in SRT. Requires Audio + SRT, one sentence per line. Emotion depends on the model; unsupported directions and sound effects are omitted."
+   },
+   "cloneQuality": {
+     "title": "Qualidade do áudio",
+@@ -555,6 +572,13 @@
      "working": "Processando…"
    },
    "clone": {
@@ -3601,7 +3853,7 @@ index 41544d5..2f4b0f4 100644
      "text_label": "Texto",
      "paste": "Colar",
      "paste_failed": "O acesso à área de transferência foi bloqueado. Cole diretamente no campo de texto usando o teclado.",
-@@ -1879,7 +1902,7 @@
+@@ -1879,7 +1903,7 @@
      "toast_flushed": "Liberado — RAM {{ram}}G · VRAM {{vram}}G{{unloaded}}",
      "toast_model_unloaded": "· modelo descarregado",
      "toast_flush_failed": "Falha na liberação: {{message}}",
@@ -3611,7 +3863,7 @@ index 41544d5..2f4b0f4 100644
      "version_dev": "v{{version}} · Desenvolvimento",
      "coming_soon": "Em breve",
 diff --git a/electron/src/renderer/src/i18n/locales/ru.json b/electron/src/renderer/src/i18n/locales/ru.json
-index 91e78c7..393f1b4 100644
+index 91e78c7..f1ab243 100644
 --- a/electron/src/renderer/src/i18n/locales/ru.json
 +++ b/electron/src/renderer/src/i18n/locales/ru.json
 @@ -1,4 +1,20 @@
@@ -3635,7 +3887,17 @@ index 91e78c7..393f1b4 100644
    "cloneEmotion": {
      "title": "Эмоция",
      "off": "Выкл.",
-@@ -563,6 +579,13 @@
+@@ -21,7 +37,8 @@
+     "tags_hint": "Для отдельных моментов внутри строки добавьте реакции вроде {{example}} через «Вставить» в сценарии.",
+     "tags_unsupported": "Серые теги {{engine}} прочитает вслух как слова.",
+     "guide": "Руководство по выразительной речи",
+-    "tip": "Совет: настройте подачу с помощью кнопки «Эмоция» ниже и добавляйте реакции вроде смеха или вздоха через «Вставить» в сценарии."
++    "tip": "Совет: настройте подачу с помощью кнопки «Эмоция» ниже и добавляйте реакции вроде смеха или вздоха через «Вставить» в сценарии.",
++    "script_tags_note": "Script directions: never spoken or shown in SRT. Requires Audio + SRT, one sentence per line. Emotion depends on the model; unsupported directions and sound effects are omitted."
+   },
+   "cloneQuality": {
+     "title": "Качество звука",
+@@ -563,6 +580,13 @@
      "working": "Обработка…"
    },
    "clone": {
@@ -3649,7 +3911,7 @@ index 91e78c7..393f1b4 100644
      "text_label": "Текст",
      "paste": "Вставить",
      "paste_failed": "Доступ к буферу обмена заблокирован. Вставьте текст прямо в поле с помощью клавиатуры.",
-@@ -1891,7 +1914,7 @@
+@@ -1891,7 +1915,7 @@
      "toast_flushed": "Сброшено — ОЗУ {{ram}}G · VRAM {{vram}}G{{unloaded}}",
      "toast_model_unloaded": "· модель выгружена",
      "toast_flush_failed": "Сброс не выполнен: {{message}}",
@@ -3659,7 +3921,7 @@ index 91e78c7..393f1b4 100644
      "version_dev": "v{{version}} · Разработка",
      "tagline": "Локальное клонирование голоса. Ничто не покидает вашу машину.",
 diff --git a/electron/src/renderer/src/i18n/locales/sv.json b/electron/src/renderer/src/i18n/locales/sv.json
-index 87ca95d..edaae5e 100644
+index 87ca95d..3ec22ff 100644
 --- a/electron/src/renderer/src/i18n/locales/sv.json
 +++ b/electron/src/renderer/src/i18n/locales/sv.json
 @@ -1,4 +1,20 @@
@@ -3683,7 +3945,17 @@ index 87ca95d..edaae5e 100644
    "cloneEmotion": {
      "title": "Känsla",
      "off": "Av",
-@@ -553,6 +569,13 @@
+@@ -21,7 +37,8 @@
+     "tags_hint": "För ögonblick inom en rad lägger du till reaktioner som {{example}} via Infoga i manuset.",
+     "tags_unsupported": "Gråade taggar skulle {{engine}} läsa upp som ord.",
+     "guide": "Guide till uttrycksfullt tal",
+-    "tip": "Tips: forma framförandet med Känsla nedan och lägg till reaktioner som skratt eller suckar via Infoga i manuset."
++    "tip": "Tips: forma framförandet med Känsla nedan och lägg till reaktioner som skratt eller suckar via Infoga i manuset.",
++    "script_tags_note": "Script directions: never spoken or shown in SRT. Requires Audio + SRT, one sentence per line. Emotion depends on the model; unsupported directions and sound effects are omitted."
+   },
+   "cloneQuality": {
+     "title": "Ljudkvalitet",
+@@ -553,6 +570,13 @@
      "working": "Bearbetar…"
    },
    "clone": {
@@ -3697,7 +3969,7 @@ index 87ca95d..edaae5e 100644
      "text_label": "Text",
      "paste": "Klistra in",
      "paste_failed": "Åtkomst till urklipp blockerades. Klistra in direkt i textfältet med tangentbordet.",
-@@ -1877,7 +1900,7 @@
+@@ -1877,7 +1901,7 @@
      "toast_flushed": "Spolat — RAM {{ram}}G · VRAM {{vram}}G{{unloaded}}",
      "toast_model_unloaded": "· modell avlastad",
      "toast_flush_failed": "Spolning misslyckades: {{message}}",
@@ -3707,7 +3979,7 @@ index 87ca95d..edaae5e 100644
      "version_dev": "v{{version}} · Utveckling",
      "tagline": "Lokal röstkloning. Inget lämnar din maskin.",
 diff --git a/electron/src/renderer/src/i18n/locales/th.json b/electron/src/renderer/src/i18n/locales/th.json
-index af3dd30..e2b0588 100644
+index af3dd30..722f0e1 100644
 --- a/electron/src/renderer/src/i18n/locales/th.json
 +++ b/electron/src/renderer/src/i18n/locales/th.json
 @@ -1,4 +1,20 @@
@@ -3731,7 +4003,17 @@ index af3dd30..e2b0588 100644
    "cloneEmotion": {
      "title": "อารมณ์",
      "off": "ปิด",
-@@ -553,6 +569,13 @@
+@@ -21,7 +37,8 @@
+     "tags_hint": "สำหรับช่วงเวลาภายในบรรทัด ให้เพิ่มปฏิกิริยาอย่าง {{example}} จาก แทรก ในสคริปต์",
+     "tags_unsupported": "{{engine}} จะอ่านแท็กสีเทาออกเสียงเป็นคำ",
+     "guide": "คู่มือเสียงพูดที่มีอารมณ์",
+-    "tip": "เคล็ดลับ: ปรับการถ่ายทอดด้วย อารมณ์ ด้านล่าง และเพิ่มปฏิกิริยาอย่างเสียงหัวเราะหรือถอนหายใจจาก แทรก ในสคริปต์"
++    "tip": "เคล็ดลับ: ปรับการถ่ายทอดด้วย อารมณ์ ด้านล่าง และเพิ่มปฏิกิริยาอย่างเสียงหัวเราะหรือถอนหายใจจาก แทรก ในสคริปต์",
++    "script_tags_note": "Script directions: never spoken or shown in SRT. Requires Audio + SRT, one sentence per line. Emotion depends on the model; unsupported directions and sound effects are omitted."
+   },
+   "cloneQuality": {
+     "title": "คุณภาพเสียง",
+@@ -553,6 +570,13 @@
      "working": "กำลังทำงาน…"
    },
    "clone": {
@@ -3745,7 +4027,7 @@ index af3dd30..e2b0588 100644
      "text_label": "ข้อความ",
      "paste": "วาง",
      "paste_failed": "การเข้าถึงคลิปบอร์ดถูกบล็อก โปรดใช้แป้นพิมพ์วางลงในช่องข้อความโดยตรง",
-@@ -1877,7 +1900,7 @@
+@@ -1877,7 +1901,7 @@
      "toast_flushed": "ฟลัช — RAM {{ram}}G · VRAM {{vram}}G{{unloaded}}",
      "toast_model_unloaded": "· โมเดลยกเลิกการโหลดแล้ว",
      "toast_flush_failed": "การฟลัชล้มเหลว: {{message}}",
@@ -3755,7 +4037,7 @@ index af3dd30..e2b0588 100644
      "version_dev": "v{{version}} · สำหรับพัฒนา",
      "tagline": "การโคลนเสียงท้องถิ่น ไม่มีอะไรเหลือจากเครื่องของคุณ",
 diff --git a/electron/src/renderer/src/i18n/locales/tr.json b/electron/src/renderer/src/i18n/locales/tr.json
-index 4822ea4..6c42dbe 100644
+index 4822ea4..3029daa 100644
 --- a/electron/src/renderer/src/i18n/locales/tr.json
 +++ b/electron/src/renderer/src/i18n/locales/tr.json
 @@ -1,4 +1,20 @@
@@ -3779,7 +4061,17 @@ index 4822ea4..6c42dbe 100644
    "cloneEmotion": {
      "title": "Duygu",
      "off": "Kapalı",
-@@ -553,6 +569,13 @@
+@@ -21,7 +37,8 @@
+     "tags_hint": "Bir satırın içindeki anlar için betikteki Ekle menüsünden {{example}} gibi tepkiler ekleyin.",
+     "tags_unsupported": "Gri etiketleri {{engine}} sözcük olarak sesli okur.",
+     "guide": "Etkileyici konuşma kılavuzu",
+-    "tip": "İpucu: aşağıdaki Duygu ile seslendirmeyi şekillendirin, betikteki Ekle menüsünden gülme veya iç çekme gibi tepkiler ekleyin."
++    "tip": "İpucu: aşağıdaki Duygu ile seslendirmeyi şekillendirin, betikteki Ekle menüsünden gülme veya iç çekme gibi tepkiler ekleyin.",
++    "script_tags_note": "Script directions: never spoken or shown in SRT. Requires Audio + SRT, one sentence per line. Emotion depends on the model; unsupported directions and sound effects are omitted."
+   },
+   "cloneQuality": {
+     "title": "Ses kalitesi",
+@@ -553,6 +570,13 @@
      "working": "İşleniyor…"
    },
    "clone": {
@@ -3793,7 +4085,7 @@ index 4822ea4..6c42dbe 100644
      "text_label": "Metin",
      "paste": "Yapıştır",
      "paste_failed": "Pano erişimi engellendi. Klavyeyi kullanarak doğrudan metin alanına yapıştırın.",
-@@ -1877,7 +1900,7 @@
+@@ -1877,7 +1901,7 @@
      "toast_flushed": "Temizlenmiş — RAM {{ram}}G · VRAM {{vram}}G{{unloaded}}",
      "toast_model_unloaded": "· model boşaltıldı",
      "toast_flush_failed": "Temizleme başarısız oldu: {{message}}",
@@ -3803,7 +4095,7 @@ index 4822ea4..6c42dbe 100644
      "version_dev": "v{{version}} · Geliştirme",
      "tagline": "Yerel ses klonlama. Hiçbir şey makinenizden ayrılmaz.",
 diff --git a/electron/src/renderer/src/i18n/locales/uk.json b/electron/src/renderer/src/i18n/locales/uk.json
-index f43879d..9cff5ec 100644
+index f43879d..8efabe9 100644
 --- a/electron/src/renderer/src/i18n/locales/uk.json
 +++ b/electron/src/renderer/src/i18n/locales/uk.json
 @@ -1,4 +1,20 @@
@@ -3827,7 +4119,17 @@ index f43879d..9cff5ec 100644
    "cloneEmotion": {
      "title": "Емоція",
      "off": "Вимк.",
-@@ -563,6 +579,13 @@
+@@ -21,7 +37,8 @@
+     "tags_hint": "Для окремих моментів у рядку додайте реакції на кшталт {{example}} через «Вставити» у сценарії.",
+     "tags_unsupported": "Сірі теги {{engine}} прочитає вголос як слова.",
+     "guide": "Посібник з виразного мовлення",
+-    "tip": "Порада: налаштуйте подачу за допомогою кнопки «Емоція» нижче й додавайте реакції на кшталт сміху чи зітхання через «Вставити» у сценарії."
++    "tip": "Порада: налаштуйте подачу за допомогою кнопки «Емоція» нижче й додавайте реакції на кшталт сміху чи зітхання через «Вставити» у сценарії.",
++    "script_tags_note": "Script directions: never spoken or shown in SRT. Requires Audio + SRT, one sentence per line. Emotion depends on the model; unsupported directions and sound effects are omitted."
+   },
+   "cloneQuality": {
+     "title": "Якість звуку",
+@@ -563,6 +580,13 @@
      "working": "Обробка…"
    },
    "clone": {
@@ -3841,7 +4143,7 @@ index f43879d..9cff5ec 100644
      "text_label": "Текст",
      "paste": "Вставити",
      "paste_failed": "Доступ до буфера обміну заблоковано. Вставте текст безпосередньо в поле за допомогою клавіатури.",
-@@ -1891,7 +1914,7 @@
+@@ -1891,7 +1915,7 @@
      "toast_flushed": "Очищено — RAM {{ram}}G · VRAM {{vram}}G{{unloaded}}",
      "toast_model_unloaded": "· модель ненавантажена",
      "toast_flush_failed": "Помилка очищення: {{message}}",
@@ -3851,7 +4153,7 @@ index f43879d..9cff5ec 100644
      "version_dev": "v{{version}} · Розробка",
      "tagline": "Клонування локального голосу. Ніщо не покидає вашу машину.",
 diff --git a/electron/src/renderer/src/i18n/locales/vi.json b/electron/src/renderer/src/i18n/locales/vi.json
-index 84feeaa..00dbb8d 100644
+index 84feeaa..2c66ef7 100644
 --- a/electron/src/renderer/src/i18n/locales/vi.json
 +++ b/electron/src/renderer/src/i18n/locales/vi.json
 @@ -1,4 +1,20 @@
@@ -3875,7 +4177,17 @@ index 84feeaa..00dbb8d 100644
    "cloneEmotion": {
      "title": "Cảm xúc",
      "off": "Tắt",
-@@ -553,6 +569,13 @@
+@@ -21,7 +37,8 @@
+     "tags_hint": "Cho các khoảnh khắc trong một dòng, hãy thêm phản ứng như {{example}} từ Chèn trong kịch bản.",
+     "tags_unsupported": "{{engine}} sẽ đọc to các thẻ màu xám thành chữ.",
+     "guide": "Hướng dẫn giọng nói biểu cảm",
+-    "tip": "Mẹo: điều chỉnh cách diễn đạt bằng Cảm xúc bên dưới, và thêm phản ứng như tiếng cười hoặc tiếng thở dài từ Chèn trong kịch bản."
++    "tip": "Mẹo: điều chỉnh cách diễn đạt bằng Cảm xúc bên dưới, và thêm phản ứng như tiếng cười hoặc tiếng thở dài từ Chèn trong kịch bản.",
++    "script_tags_note": "Thẻ chỉ dẫn: không đọc thành lời, không vào SRT. Dùng Audio + SRT, mỗi dòng một câu. Cảm xúc tùy mô hình; chỉ dẫn và tiếng phản ứng chưa hỗ trợ sẽ được bỏ qua."
+   },
+   "cloneQuality": {
+     "title": "Chất lượng âm thanh",
+@@ -553,6 +570,13 @@
      "working": "Đang xử lý…"
    },
    "clone": {
@@ -3889,7 +4201,7 @@ index 84feeaa..00dbb8d 100644
      "text_label": "Văn bản",
      "paste": "Dán",
      "paste_failed": "Quyền truy cập bảng nhớ tạm đã bị chặn. Hãy dùng bàn phím để dán trực tiếp vào ô văn bản.",
-@@ -1877,7 +1900,7 @@
+@@ -1877,7 +1901,7 @@
      "toast_flushed": "Đã xóa — RAM {{ram}}G · VRAM {{vram}}G{{unloaded}}",
      "toast_model_unloaded": "· dỡ mô hình",
      "toast_flush_failed": "Xóa không thành công: {{message}}",
@@ -3899,7 +4211,7 @@ index 84feeaa..00dbb8d 100644
      "version_dev": "v{{version}} · Phát triển",
      "tagline": "Nhân bản giọng nói địa phương. Không có gì rời khỏi máy của bạn.",
 diff --git a/electron/src/renderer/src/i18n/locales/zh-CN.json b/electron/src/renderer/src/i18n/locales/zh-CN.json
-index 91c77fc..9ae1000 100644
+index 91c77fc..7f2f40b 100644
 --- a/electron/src/renderer/src/i18n/locales/zh-CN.json
 +++ b/electron/src/renderer/src/i18n/locales/zh-CN.json
 @@ -1,4 +1,20 @@
@@ -3923,7 +4235,17 @@ index 91c77fc..9ae1000 100644
    "cloneEmotion": {
      "title": "情绪",
      "off": "关闭",
-@@ -568,6 +584,13 @@
+@@ -21,7 +37,8 @@
+     "tags_hint": "如需在一行中的某个时刻加入反应，请从脚本的“插入”中添加 {{example}} 等反应。",
+     "tags_unsupported": "灰色标签会被 {{engine}} 当作文字读出来。",
+     "guide": "富有表现力的语音指南",
+-    "tip": "提示：用下方的“情绪”塑造演绎，并从脚本的“插入”中添加笑声或叹气等反应。"
++    "tip": "提示：用下方的“情绪”塑造演绎，并从脚本的“插入”中添加笑声或叹气等反应。",
++    "script_tags_note": "Script directions: never spoken or shown in SRT. Requires Audio + SRT, one sentence per line. Emotion depends on the model; unsupported directions and sound effects are omitted."
+   },
+   "cloneQuality": {
+     "title": "音频质量",
+@@ -568,6 +585,13 @@
      "working": "处理中…"
    },
    "clone": {
@@ -3937,7 +4259,7 @@ index 91c77fc..9ae1000 100644
      "text_label": "文本",
      "paste": "粘贴",
      "paste_failed": "剪贴板访问被阻止。请使用键盘直接粘贴到文本框中。",
-@@ -1877,7 +1900,7 @@
+@@ -1877,7 +1901,7 @@
      "toast_flushed": "刷新 — RAM {{ram}}G · VRAM {{vram}}G{{unloaded}}",
      "toast_model_unloaded": "· 模型卸载",
      "toast_flush_failed": "刷新失败：{{message}}",
@@ -3947,7 +4269,7 @@ index 91c77fc..9ae1000 100644
      "version_dev": "v{{version}} · 开发版",
      "tagline": "本地语音克隆。没有任何东西离开你的机器。",
 diff --git a/electron/src/renderer/src/i18n/locales/zh-TW.json b/electron/src/renderer/src/i18n/locales/zh-TW.json
-index 5dad25f..6099e3d 100644
+index 5dad25f..121ac7b 100644
 --- a/electron/src/renderer/src/i18n/locales/zh-TW.json
 +++ b/electron/src/renderer/src/i18n/locales/zh-TW.json
 @@ -1,4 +1,20 @@
@@ -3971,7 +4293,17 @@ index 5dad25f..6099e3d 100644
    "cloneEmotion": {
      "title": "情緒",
      "off": "關閉",
-@@ -553,6 +569,13 @@
+@@ -21,7 +37,8 @@
+     "tags_hint": "如需在一行中的某個時刻加入反應，請從腳本的「插入」中加入 {{example}} 等反應。",
+     "tags_unsupported": "灰色標籤會被 {{engine}} 當作文字唸出來。",
+     "guide": "富有表現力的語音指南",
+-    "tip": "提示：用下方的「情緒」塑造演繹，並從腳本的「插入」中加入笑聲或嘆氣等反應。"
++    "tip": "提示：用下方的「情緒」塑造演繹，並從腳本的「插入」中加入笑聲或嘆氣等反應。",
++    "script_tags_note": "Script directions: never spoken or shown in SRT. Requires Audio + SRT, one sentence per line. Emotion depends on the model; unsupported directions and sound effects are omitted."
+   },
+   "cloneQuality": {
+     "title": "音訊品質",
+@@ -553,6 +570,13 @@
      "working": "處理中…"
    },
    "clone": {
@@ -3985,7 +4317,7 @@ index 5dad25f..6099e3d 100644
      "text_label": "文字",
      "paste": "貼上",
      "paste_failed": "剪貼簿存取遭到封鎖。請使用鍵盤直接貼上到文字欄位。",
-@@ -1877,7 +1900,7 @@
+@@ -1877,7 +1901,7 @@
      "toast_flushed": "刷新 — RAM {{ram}}G · VRAM {{vram}}G{{unloaded}}",
      "toast_model_unloaded": "· 模型卸載",
      "toast_flush_failed": "刷新失敗：{{message}}",
@@ -4631,6 +4963,72 @@ index 0000000..445046d
 +        self.assertEqual(timestamp(44100*3600+22050,44100),'01:00:00,500')
 +
 +if __name__ == '__main__': unittest.main()
+diff --git a/tests/test_script_expression.py b/tests/test_script_expression.py
+new file mode 100644
+index 0000000..cf5784f
+--- /dev/null
++++ b/tests/test_script_expression.py
+@@ -0,0 +1,60 @@
++"""No GPU: separate directions, audible text and sample-aligned captions."""
++import functools
++import sys
++import unittest
++from pathlib import Path
++sys.path.insert(0, str(Path(__file__).parents[1] / 'backend'))
++from services.script_expression import DIRECTIONS, parse_line, caption_text, audio_text, render_line_call
++from services.line_subtitles import LineClock
++
++class NoneEngine:
++    inline_tags = ()
++class DirectionEngine:
++    instruct_directs_delivery = True
++    inline_tags = ('[laughter]',)
++class GradedEngine:
++    supports_emotion = True
++
++class ScriptExpressionTests(unittest.TestCase):
++    def test_every_proposed_tag_is_never_spoken_or_captioned(self):
++        for tag in DIRECTIONS:
++            with self.subTest(tag=tag):
++                line=f'[{tag}] Hello world. [/{tag}]'
++                self.assertEqual(audio_text(line,NoneEngine),'Hello world.')
++                self.assertEqual(caption_text(line),'Hello world.')
++    def test_preserves_pronunciation_overrides_and_unrelated_brackets(self):
++        source='[2026] [[Tokyo|とうきょう]] [unknown]'
++        self.assertEqual(parse_line(source),(source,''))
++        self.assertEqual(parse_line('[[angry]]'),('[[angry]]',''))
++    def test_case_and_multiple_tags(self):
++        self.assertEqual(parse_line('[ANGRY][shouting] Go!'),('Go!','angry, shouting'))
++    def test_native_reactions_stay_only_in_supported_audio(self):
++        source='[angry][laughter] No.'
++        self.assertEqual(audio_text(source,DirectionEngine),'[laughter] No.')
++        self.assertEqual(audio_text(source,NoneEngine),'No.')
++        self.assertEqual(caption_text(source),'No.')
++    def test_tag_only_line_has_no_caption(self):
++        self.assertEqual(caption_text('[crying]'),'')
++    def test_multilingual_cues_keep_audio_sample_timing_and_pause(self):
++        lines=[caption_text(x) for x in ['[angry] 出ていけ！','[whispering] 조용히 해.']]
++        clock=LineClock(lines);clock.append(24000,24000,500);clock.append(48000,24000,500)
++        self.assertIn('00:00:01,500 --> 00:00:03,500\n조용히 해.',clock.srt())
++        self.assertNotIn('[',clock.srt())
++    def test_direction_is_per_line_and_does_not_modify_base_voice(self):
++        base=functools.partial(lambda *a,**k:(a,k),None,'text','en','ref','transcript','original',emotion_kwargs={'emo_audio':'saved'})
++        first=render_line_call(base,'Hello','whispering',DirectionEngine,True)()
++        second=render_line_call(base,'Next','',DirectionEngine,True)()
++        self.assertEqual(first[0][5],'original, whispering')
++        self.assertEqual(second[0][5],'original')
++        self.assertEqual(base.keywords['emotion_kwargs'],{'emo_audio':'saved'})
++    def test_graded_engine_receives_separate_emotion_not_spoken_tags(self):
++        base=functools.partial(lambda *a,**k:k,None,'text','en',None,None,None,emotion_kwargs={'emo_vector':[1]*8})
++        result=render_line_call(base,'Please','pleading',GradedEngine,True)()
++        self.assertEqual(result['emotion_kwargs']['emo_text'],'pleading')
++        self.assertNotIn('emo_vector',result['emotion_kwargs'])
++    def test_unsupported_engine_keeps_spoken_text_and_reference_unchanged(self):
++        base=functools.partial(lambda *a,**k:a,None,'text','en','ref','transcript','voice')
++        result=render_line_call(base,'Hello','crying',NoneEngine,False)()
++        self.assertEqual(result,(None,'Hello','en','ref','transcript','voice'))
++
++if __name__ == '__main__':unittest.main()
 diff --git a/tests/test_txt_srt_updater.py b/tests/test_txt_srt_updater.py
 new file mode 100644
 index 0000000..65a159c
