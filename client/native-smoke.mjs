@@ -4,6 +4,8 @@ import { createConnection } from 'node:net';
 const executablePath=process.argv[2];
 const screenshot=process.argv[3];
 const app=await _electron.launch({executablePath,args:['--disable-gpu'],timeout:60000});
+app.process().stdout?.on('data',data=>console.log('MAIN STDOUT',data.toString()));
+app.process().stderr?.on('data',data=>console.log('MAIN STDERR',data.toString()));
 try {
   const page=await app.firstWindow();
   await page.waitForSelector('#machine');
@@ -41,7 +43,20 @@ try {
   let main;
   for(let n=0;n<60;n++){main=app.windows().find(w=>w!==page&&!w.isClosed());if(main)break;await new Promise(r=>setTimeout(r,500));}
   assert.ok(main,'Main window did not open after activation');
-  await main.waitForFunction(()=>document.querySelector('#root')?.childElementCount>0,null,{timeout:60000});
+  try {
+    await main.waitForFunction(()=>document.querySelector('#root')?.childElementCount>0,null,{timeout:8000});
+  } catch {
+    console.log('DIAGNOSTIC',await app.evaluate(({app,net})=>({root:app.getAppPath(),resources:process.resourcesPath})));
+    await app.evaluate(async ({app,protocol,net})=>{
+      const {createRequire}=process.getBuiltinModule('module');const require=createRequire(process.execPath);
+      const {pathToFileURL}=require('node:url');const {join}=require('node:path');
+      protocol.unhandle('app');
+      protocol.handle('app',request=>net.fetch(pathToFileURL(join(app.getAppPath(),'out','renderer',new URL(request.url).pathname)).toString()));
+    });
+    await main.reload();
+    await main.waitForFunction(()=>document.querySelector('#root')?.childElementCount>0,null,{timeout:15000});
+    throw new Error('DIAGNOSTIC: file URL handler restores rendering; apply production fix');
+  }
   assert.deepEqual(uiErrors,[]);
   await main.screenshot({path:screenshot.replace('.png','-MAIN.png')});
   console.log('Native Windows main renderer mounted after activation.');
