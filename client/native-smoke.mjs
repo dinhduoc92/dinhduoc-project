@@ -25,4 +25,24 @@ try {
   assert.equal(listening,false,'The backend started before activation');
   await page.screenshot({path:screenshot});
   console.log('Native Windows activation gate passed: machine ID, clipboard, invalid-code lock and backend blocked.');
+  // Runner-only verifier stub: never modifies the packaged app or its trust keys.
+  // Signature validation itself is covered separately with real RSA test keys.
+  await app.evaluate(async () => {
+    const { createRequire, syncBuiltinESMExports } = await import('node:module');
+    const require = createRequire(process.execPath);
+    require('node:crypto').verify = () => true;
+    syncBuiltinESMExports();
+  });
+  const payload=Buffer.from(JSON.stringify({v:1,product:'vn.dinhduoc.voicestudio',kid:'cd5595bf4155492c',machine:displayed,iat:Math.floor(Date.now()/1000),exp:null,note:'CI only',nonce:'a'.repeat(32)})).toString('base64url');
+  await page.locator('#key').fill(`DDVS1.${payload}.${Buffer.alloc(384).toString('base64url')}`);
+  const uiErrors=[];
+  app.on('window',window=>{window.on('pageerror',e=>{uiErrors.push(e.message);console.log('RENDERER ERROR',e.stack)});window.on('console',m=>{if(m.type()==='error')console.log('RENDERER CONSOLE',m.text())});});
+  await page.locator('#activate').click();
+  let main;
+  for(let n=0;n<60;n++){main=app.windows().find(w=>w!==page&&!w.isClosed());if(main)break;await new Promise(r=>setTimeout(r,500));}
+  assert.ok(main,'Main window did not open after activation');
+  await main.waitForFunction(()=>document.querySelector('#root')?.childElementCount>0,{timeout:60000});
+  assert.deepEqual(uiErrors,[]);
+  await main.screenshot({path:screenshot.replace('.png','-MAIN.png')});
+  console.log('Native Windows main renderer mounted after activation.');
 } finally {await app.close();}
