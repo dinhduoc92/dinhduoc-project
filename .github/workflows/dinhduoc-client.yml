@@ -1,0 +1,39 @@
+name: Build Dinh Duoc activated Voice Studio
+on:
+  push:
+    branches: [dinhduoc-voice-studio-client]
+    paths: ['client/**', '.github/workflows/dinhduoc-client.yml']
+  workflow_dispatch:
+permissions:
+  contents: write
+jobs:
+  windows-client:
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - name: Install build tools
+        shell: pwsh
+        run: |
+          npm install --prefix tooling bun@1.4.2 @electron/asar@4.3.1 7zip-bin@5.2.0 playwright@1.64.1 --no-audit --no-fund
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          (Resolve-Path tooling/node_modules/bun/bin).Path | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+      - name: Build, test activation and package Windows app
+        shell: pwsh
+        run: python client/build_client.py
+      - name: Attach app to owner draft release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $files = Get-ChildItem -File dist | ForEach-Object FullName
+          gh release upload dinhduoc-voice-studio-client-v1 @files --repo $env:GITHUB_REPOSITORY --clobber
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: success() || failure()
+        with:
+          name: Dinh-Duoc-Voice-Studio-Windows
+          path: dist/*
+          if-no-files-found: warn
+          retention-days: 14

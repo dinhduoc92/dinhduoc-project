@@ -1,0 +1,44 @@
+ĐÌNH ĐƯỢC- VOICE STUDIO — WINDOWS X64
+
+MỞ APP
+1. Giải nén toàn bộ ZIP vào một thư mục riêng, ví dụ D:\DinhDuocVoiceStudio.
+2. Mở DINH-DUOC-VOICE-STUDIO.exe. Giữ nguyên các thư mục đi kèm.
+3. Lần đầu app hiển thị MÃ MÁY. Sao chép mã này gửi cho người cấp mã.
+4. Nhập mã kích hoạt được cấp cho đúng máy đó.
+5. Sau khi kích hoạt hợp lệ, mới thiết lập môi trường AI và chọn mô hình.
+
+BẠN LÀ CHỦ APP
+Bạn cũng cần cấp mã cho chính máy mình khi mở app mới.
+Dùng công cụ MO-CONG-CU-CAP-MA.cmd đã tải trước đó, dán mã máy từ app mới,
+chọn số ngày và tạo mã. Dán phần bắt đầu DDVS1. vào app.
+Giữ công cụ cấp mã và file khóa riêng trên máy bạn. Bạn bè chỉ nhận gói app này
+và mã kích hoạt của họ. Gói app chỉ chứa khóa công khai đã được bạn cung cấp.
+Thời hạn tính từ lúc bạn tạo mã. Mã sai máy hoặc hết hạn sẽ không mở được app.
+
+SỬA KHOẢNG NGHỈ + SRT
+- Trong Nhân bản giọng nói, nhập TXT (mỗi dòng là một câu).
+- Bật Lưu âm thanh + SRT; khoảng nghỉ mặc định 0,5 giây giữa hai câu.
+- Thanh Khoảng nghỉ giữa câu cho phép chọn 0–5 giây; muốn đọc chậm rãi có thể
+  thử 0,8 hoặc 1,0 giây. Giá trị áp dụng cho lần tổng hợp tiếp theo.
+- SRT tự cộng cả thời gian nghỉ để giữ khớp audio; không cần Transcriptions.
+- Audio đã tạo trước đây phải tổng hợp lại để áp dụng khoảng nghỉ mới.
+- Chọn nhiều TXT để xử lý lần lượt; mỗi cặp audio + SRT mang đúng tên TXT.
+
+DỮ LIỆU VÀ MÔ HÌNH
+Đây là app riêng, dùng thư mục DinhDuocVoiceStudio và cổng backend 43900.
+Nó không tự chuyển dữ liệu giọng clone từ app VoiceStudio cũ.
+Nếu máy đã có môi trường/mô hình, ở bước thiết lập App environment có thể chọn
+lại thư mục môi trường cũ để tái sử dụng khi phù hợp. Đóng app cũ trước khi dùng.
+Giữ lại bản cũ cho đến khi bạn kiểm tra xong app mới.
+Bạn bè cần cài môi trường AI và tải mô hình phù hợp phần cứng của họ.
+
+GIỚI HẠN
+Mã offline cần ngày giờ Windows đúng. Đổi/cài lại Windows có thể đổi mã máy.
+Mã offline không tự thu hồi từ xa; cần máy chủ nếu muốn quản lý thu hồi online.
+Ứng dụng nguồn mở không thể hứa chống mọi sửa đổi để bỏ khóa.
+Giấy phép mô hình (bao gồm giới hạn thương mại nếu có) vẫn áp dụng.
+
+MÃ NGUỒN
+Bản tùy chỉnh từ VoiceStudio v0.5.8, AGPL-3.0. LICENSE và LICENSE-NOTICE.md
+được giữ trong app. SOURCE-DINH-DUOC.zip tại cùng trang phát hành chứa mã nguồn
+và kiểm tra tương ứng. Đây không phải bản phát hành chính thức của tác giả gốc.
